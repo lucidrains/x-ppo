@@ -1,7 +1,7 @@
 import torch
-from torch_einops_utils import z_score, masked_mean
+from torch_einops_utils import masked_mean
 
-from x_ppo.ppo import calc_ratios, cast_tuple, force_fp32, ppo_actor_loss
+from x_ppo.ppo import calc_ratios, cast_tuple, force_fp32, ppo_actor_loss, prepare_advantages
 from x_ppo.values import resolve_grouped_mask
 
 # helpers
@@ -25,12 +25,19 @@ def spo_actor_loss(
     dual_clip = False,
     dual_clip_threshold = 3.,
     log_ratio_clamp = None,
-    group_dim = -2
+    group_dim = -2,
+    min_advantage_std = None,
+    return_stats = False
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
 
-    if normalize_advantages:
-        advantages = z_score(advantages, mask = mask)
+    advantages, stats, skip_update = prepare_advantages(
+        advantages,
+        mask = mask,
+        normalize = normalize_advantages,
+        return_stats = return_stats,
+        min_std = min_advantage_std
+    )
 
     # delightful policy gradient - Ian Osband https://arxiv.org/abs/2603.14608
 
@@ -71,7 +78,10 @@ def spo_actor_loss(
         )
         loss = torch.where(advantages > 0, ppo_loss, loss)
 
-    if not exists(mask):
-        return loss
+    if exists(mask):
+        loss = masked_mean(loss, mask = mask)
 
-    return masked_mean(loss, mask = mask)
+    if skip_update:
+        loss = loss * 0.
+
+    return (loss, stats) if return_stats else loss

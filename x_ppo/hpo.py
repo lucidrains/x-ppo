@@ -1,7 +1,7 @@
 import torch
-from torch_einops_utils import z_score, masked_mean
+from torch_einops_utils import masked_mean
 
-from x_ppo.ppo import cast_tuple, force_fp32, exists
+from x_ppo.ppo import cast_tuple, force_fp32, exists, prepare_advantages
 from x_ppo.values import resolve_grouped_mask
 
 @force_fp32
@@ -16,12 +16,19 @@ def hpo_actor_loss(
     delight_temp = 1.,
     log_ratio_clamp = None,
     advantage_clip = 2.,
-    group_dim = -2
+    group_dim = -2,
+    min_advantage_std = 1e-6,
+    return_stats = False
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
 
-    if normalize_advantages:
-        advantages = z_score(advantages, mask = mask)
+    advantages, stats, skip_update = prepare_advantages(
+        advantages,
+        mask = mask,
+        normalize = normalize_advantages,
+        return_stats = return_stats,
+        min_std = min_advantage_std
+    )
 
     if delightful:
         gate = (-action_log_probs * advantages / delight_temp).sigmoid().detach()
@@ -53,4 +60,10 @@ def hpo_actor_loss(
     abs_error = error.abs()
     loss = weight * torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)
 
-    return masked_mean(loss, mask = mask) if exists(mask) else loss
+    if exists(mask):
+        loss = masked_mean(loss, mask = mask)
+
+    if skip_update:
+        loss = loss * 0.
+
+    return (loss, stats) if return_stats else loss

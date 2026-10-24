@@ -42,6 +42,27 @@ def calc_ratios(
 
     return log_ratios.exp()
 
+def prepare_advantages(
+    advantages,
+    mask = None,
+    normalize = False,
+    return_stats = False,
+    min_std = None
+):
+    stats = None
+    z_mask = mask.bool() if is_tensor(mask) else mask
+
+    if normalize:
+        advantages, stats = z_score(advantages, mask = z_mask, return_stats = True)
+    elif return_stats or exists(min_std):
+        stats = z_score(advantages, mask = z_mask, return_only_stats = True)
+
+    # zero-variance advantages carry no policy gradient - DAPO dynamic sampling https://arxiv.org/abs/2503.14476
+
+    skip_update = exists(min_std) and bool((stats.var <= min_std ** 2).all())
+
+    return advantages, stats, skip_update
+
 @force_fp32
 def ppo_actor_loss(
     action_log_probs,
@@ -55,12 +76,19 @@ def ppo_actor_loss(
     dual_clip = False,
     dual_clip_threshold = 3.,
     log_ratio_clamp = None,
-    group_dim = -2
+    group_dim = -2,
+    min_advantage_std = None,
+    return_stats = False
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
 
-    if normalize_advantages:
-        advantages = z_score(advantages, mask = mask)
+    advantages, stats, skip_update = prepare_advantages(
+        advantages,
+        mask = mask,
+        normalize = normalize_advantages,
+        return_stats = return_stats,
+        min_std = min_advantage_std
+    )
 
     # delightful policy gradient - Ian Osband https://arxiv.org/abs/2603.14608
 
@@ -86,7 +114,10 @@ def ppo_actor_loss(
 
     loss = -surr
 
-    if not exists(mask):
-        return loss
+    if exists(mask):
+        loss = masked_mean(loss, mask = mask)
 
-    return masked_mean(loss, mask = mask)
+    if skip_update:
+        loss = loss * 0.
+
+    return (loss, stats) if return_stats else loss

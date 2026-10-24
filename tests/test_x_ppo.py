@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import cat, nn, tensor
 from torch.distributions import Bernoulli, Categorical, Distribution, Normal, OneHotCategorical, kl_divergence
-from torch_einops_utils import lens_to_mask
+from torch_einops_utils import lens_to_mask, z_score
 
 from x_ppo import (
     DaggerDistiller,
@@ -89,6 +89,44 @@ def test_actor_loss(
 
     assert exists(action_log_probs.grad)
 
+@param('loss_fn', (ppo_actor_loss, spo_actor_loss, hpo_actor_loss))
+def test_actor_loss_stats_and_skip(loss_fn):
+    action_log_probs = torch.randn(2, 4, requires_grad = True)
+    old_action_log_probs = torch.randn(2, 4)
+    advantages = torch.tensor([
+        [1., -1., 2., 4.],
+        [0.5, -0.5, 1., -2.]
+    ])
+    mask = torch.tensor([
+        [1., 1., 1., 0.],
+        [1., 1., 1., 1.]
+    ]).bool()
+
+    loss, stats = loss_fn(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        mask = mask,
+        normalize_advantages = True,
+        return_stats = True
+    )
+
+    expected = z_score(advantages, mask = mask, return_only_stats = True)
+
+    assert torch.allclose(stats.mean, expected.mean)
+    assert torch.allclose(stats.var, expected.var)
+
+    loss, stats = loss_fn(
+        action_log_probs,
+        old_action_log_probs,
+        torch.ones(2, 4),
+        min_advantage_std = 1e-3,
+        return_stats = True
+    )
+
+    assert torch.all(loss == 0.)
+    assert torch.allclose(stats.var, torch.zeros(1, 1))
+
 def test_log_ratio_clamp_prevents_overflow():
     action_log_probs = torch.tensor([200., -200.], requires_grad = True)
     old_action_log_probs = torch.zeros(2)
@@ -147,7 +185,7 @@ def test_hpo():
     log_ratios = eps - distances
     ones = torch.ones_like(log_ratios)
 
-    hpo = grad_magnitude(partial(hpo_actor_loss, eps_clip = eps), log_ratios, ones)
+    hpo = grad_magnitude(partial(hpo_actor_loss, eps_clip = eps, min_advantage_std = None), log_ratios, ones)
     ppo = grad_magnitude(partial(ppo_actor_loss, eps_clip = eps), log_ratios, ones)
 
     assert hpo[0] < 1e-6 and torch.all(hpo[1:] >= hpo[:-1] - 1e-6) and torch.allclose(hpo[4], torch.ones(()))
@@ -171,6 +209,12 @@ def test_hpo():
     hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1.5, -1.5]), eps_clip = 0.2, advantage_clip = (1., 2.)).sum().backward()
 
     assert torch.allclose(log_ratios.grad, torch.full((2,), -0.375))
+
+    # zero variance advantages are skipped by default
+
+    zero_var_loss = hpo_actor_loss(torch.zeros(4, requires_grad = True), torch.zeros(4), torch.ones(4))
+
+    assert torch.all(zero_var_loss == 0.)
 
 @param('loss_fn', (ppo_actor_loss, spo_actor_loss, hpo_actor_loss))
 def test_actor_loss_fp32(loss_fn):

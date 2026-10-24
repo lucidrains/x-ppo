@@ -45,6 +45,23 @@ loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages)
 loss.mean().backward()
 ```
 
+`ppo_actor_loss`, `spo_actor_loss` and `hpo_actor_loss` all accept `return_stats = True` to also return the advantage z-score statistics, and `min_advantage_std` to return zero loss when the advantages are degenerate - DAPO dynamic sampling, [Yu et al.](https://arxiv.org/abs/2503.14476)
+
+`hpo_actor_loss` defaults `min_advantage_std = 1e-6`; PPO and SPO default to `None`.
+
+```python
+loss, stats = ppo_actor_loss(
+    action_log_probs,
+    old_action_log_probs,
+    advantages,
+    normalize_advantages = True,
+    return_stats = True,
+    min_advantage_std = 1e-6
+)
+
+stats.mean, stats.var
+```
+
 ### critic loss
 
 Clipped value regression - Schulman et al.
