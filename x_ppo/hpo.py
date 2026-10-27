@@ -1,7 +1,7 @@
 import torch
 from torch_einops_utils import masked_mean
 
-from x_ppo.ppo import cast_tuple, force_fp32, exists, prepare_advantages
+from x_ppo.ppo import cast_tuple, force_fp32, exists, prepare_advantages, resolve_action_dims
 from x_ppo.values import resolve_grouped_mask
 
 @force_fp32
@@ -16,6 +16,7 @@ def hpo_actor_loss(
     delight_temp = 1.,
     log_ratio_clamp = None,
     advantage_clip = 2.,
+    per_action_dim = False,
     group_dim = -2,
     min_advantage_std = 1e-6,
     return_stats = False
@@ -28,6 +29,13 @@ def hpo_actor_loss(
         normalize = normalize_advantages,
         return_stats = return_stats,
         min_std = min_advantage_std
+    )
+
+    action_log_probs, old_action_log_probs, advantages, has_action_dim = resolve_action_dims(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        per_action_dim = per_action_dim
     )
 
     if delightful:
@@ -59,6 +67,9 @@ def hpo_actor_loss(
     error = log_ratios - target
     abs_error = error.abs()
     loss = weight * torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)
+
+    if has_action_dim:
+        loss = loss.mean(dim = -1)
 
     if exists(mask):
         loss = masked_mean(loss, mask = mask)

@@ -51,12 +51,26 @@ def actor_loss(
     old_log_probs,
     advantages,
     eps_clip,
-    advantage_clip = 1.
+    advantage_clip = 1.,
+    per_action_dim = False
 ):
     if method == 'ppo':
-        return ppo_actor_loss(log_probs, old_log_probs, advantages, eps_clip = eps_clip)
+        return ppo_actor_loss(
+            log_probs,
+            old_log_probs,
+            advantages,
+            eps_clip = eps_clip,
+            per_action_dim = per_action_dim
+        )
 
-    return hpo_actor_loss(log_probs, old_log_probs, advantages, eps_clip = eps_clip, advantage_clip = advantage_clip)
+    return hpo_actor_loss(
+        log_probs,
+        old_log_probs,
+        advantages,
+        eps_clip = eps_clip,
+        advantage_clip = advantage_clip,
+        per_action_dim = per_action_dim
+    )
 
 
 @torch.no_grad()
@@ -107,6 +121,7 @@ def train(
     lam = 0.95,
     eps_clip = 0.2,
     advantage_clip = 1.,
+    per_action_dim = False,
     rpo_alpha = 0.,
     value_coef = 0.5,
     entropy_coef = 0.01,
@@ -166,7 +181,11 @@ def train(
             actions.append(action)
 
             log_prob = dist.log_prob(action)
-            old_log_probs.append((log_prob.sum(-1) if continuous else log_prob).detach())
+
+            if continuous and not per_action_dim:
+                log_prob = log_prob.sum(-1)
+
+            old_log_probs.append(log_prob.detach())
 
             rewards.append(reward)
             values.append(value)
@@ -229,7 +248,9 @@ def train(
                 entropy = dist.entropy()
 
                 if continuous:
-                    log_prob = log_prob.sum(-1)
+                    if not per_action_dim:
+                        log_prob = log_prob.sum(-1)
+
                     entropy = entropy.sum(-1)
 
                 policy_loss = actor_loss(
@@ -238,7 +259,8 @@ def train(
                     old_log_prob,
                     advantage,
                     eps_clip,
-                    advantage_clip = advantage_clip
+                    advantage_clip = advantage_clip,
+                    per_action_dim = per_action_dim
                 ).mean()
 
                 with torch.no_grad():
@@ -258,6 +280,10 @@ def train(
 
                 with torch.no_grad():
                     log_ratio = log_prob - old_log_prob
+
+                    if per_action_dim and continuous:
+                        log_ratio = log_ratio.mean(-1)
+
                     update_max_log_ratio = max(update_max_log_ratio, log_ratio.abs().max().item())
                     update_clipped += ((log_ratio.abs() > eps_clip).float().mean().item())
                     update_grad_norm += grad_norm.item()
@@ -315,6 +341,7 @@ def train(
             'lam': lam,
             'eps_clip': eps_clip,
             'advantage_clip': advantage_clip,
+            'per_action_dim': per_action_dim,
             'rpo_alpha': rpo_alpha,
             'value_coef': value_coef,
             'entropy_coef': entropy_coef,
@@ -410,6 +437,7 @@ def run(
     lr = 3e-4,
     eps = 0.2,
     advantage_clip = 1.,
+    per_action_dim = False,
     rpo_alpha = 0.,
     grad_clip = 0.5,
     eval_every = 5,
@@ -444,6 +472,7 @@ def run(
                 lr = lr,
                 eps_clip = eps,
                 advantage_clip = advantage_clip,
+                per_action_dim = per_action_dim,
                 rpo_alpha = rpo_alpha,
                 grad_clip = grad_clip,
                 eval_every = eval_every,

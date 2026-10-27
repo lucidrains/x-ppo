@@ -1739,3 +1739,181 @@ def test_dagger_e2e_privileged(loss_fn):
     student_goal = goal_distance(student)
 
     assert student_goal < goal_distance(snapshot) * 0.5, f'{student_goal=:.3f}'
+
+@param('loss_fn', (ppo_actor_loss, spo_actor_loss, partial(spo_actor_loss, asymmetric = True), hpo_actor_loss))
+@param('per_action_dim', (False, True))
+@param('use_mask', (False, True))
+def test_per_action_dim_actor_loss(loss_fn, per_action_dim, use_mask):
+    batch, seq, dim_action = 2, 4, 5
+    action_log_probs = torch.randn(batch, seq, dim_action, requires_grad = True)
+    old_action_log_probs = action_log_probs.detach().clone()
+    advantages = torch.randn(batch, seq)
+    mask = lens_to_mask(torch.tensor([2, 4]), seq) if use_mask else None
+
+    loss = loss_fn(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        mask = mask,
+        per_action_dim = per_action_dim,
+        normalize_advantages = True
+    )
+
+    if use_mask:
+        assert loss.ndim == 0
+    else:
+        assert loss.shape == (batch, seq)
+
+    loss.sum().backward()
+    assert exists(action_log_probs.grad)
+    assert action_log_probs.grad.shape == (batch, seq, dim_action)
+
+    # without per action dim, log probs are summed before the loss
+
+    if not per_action_dim:
+        summed_log_probs = action_log_probs.detach().sum(dim = -1).requires_grad_(True)
+        expected = loss_fn(
+            summed_log_probs,
+            old_action_log_probs.sum(dim = -1),
+            advantages,
+            mask = mask,
+            normalize_advantages = True
+        )
+        assert torch.allclose(loss, expected, atol = 1e-5)
+
+def per_action_dim_inputs():
+    torch.manual_seed(0)
+
+    log_ratios = torch.randn(2, 4, 3) * 0.5
+    action_log_probs = log_ratios.clone().requires_grad_(True)
+    old_action_log_probs = torch.zeros_like(log_ratios)
+    advantages = torch.tensor([
+        [1., -1., 0.5, -0.5],
+        [2., -2., 0., 1.]
+    ])
+
+    return action_log_probs, old_action_log_probs, advantages
+
+def test_ppo_per_action_dim_matches_reference():
+    action_log_probs, old_action_log_probs, advantages = per_action_dim_inputs()
+    eps_low, eps_high = 0.2, 0.3
+
+    loss = ppo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        eps_clip = (eps_low, eps_high),
+        per_action_dim = True
+    )
+
+    ratios = action_log_probs.exp()
+    adv = advantages[..., None]
+    clipped_ratios = ratios.clamp(1. - eps_low, 1. + eps_high)
+    surr = torch.min(ratios * adv, clipped_ratios * adv)
+
+    expected = -surr.mean(dim = -1)
+
+    assert torch.allclose(loss, expected)
+
+def test_asymmetric_spo_matches_ppo_branch():
+    torch.manual_seed(0)
+
+    action_log_probs = torch.randn(2, 5)
+    old_action_log_probs = torch.randn(2, 5)
+    advantages = torch.randn(2, 5)
+    eps_clip = (0.2, 0.3)
+
+    loss = spo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        eps_clip = eps_clip,
+        asymmetric = True
+    )
+
+    ratios = (action_log_probs - old_action_log_probs).exp()
+    eps = torch.where(ratios >= 1., eps_clip[1], eps_clip[0])
+
+    surr = ratios * advantages - advantages.abs() * (ratios - 1.).square() / (2 * eps)
+    ppo_loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages, eps_clip = eps_clip)
+
+    expected = torch.where(advantages > 0, ppo_loss, -surr)
+
+    assert torch.allclose(loss, expected)
+
+@param('asymmetric', (False, True))
+def test_spo_per_action_dim_matches_reference(asymmetric):
+    action_log_probs, old_action_log_probs, advantages = per_action_dim_inputs()
+    eps_low, eps_high = 0.2, 0.3
+
+    loss = spo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        eps_clip = (eps_low, eps_high),
+        asymmetric = asymmetric,
+        per_action_dim = True
+    )
+
+    ratios = action_log_probs.exp()
+    eps = torch.where(ratios >= 1., eps_high, eps_low)
+    adv = advantages[..., None]
+
+    surr = ratios * adv - adv.abs() * (ratios - 1.).square() / (2 * eps)
+
+    if asymmetric:
+        clipped_ratios = ratios.clamp(1. - eps_low, 1. + eps_high)
+        ppo_surr = torch.min(ratios * adv, clipped_ratios * adv)
+        surr = torch.where(adv > 0, ppo_surr, surr)
+
+    expected = -surr.mean(dim = -1)
+
+    assert torch.allclose(loss, expected)
+
+def test_hpo_per_action_dim_matches_reference():
+    action_log_probs, old_action_log_probs, advantages = per_action_dim_inputs()
+    eps_low, eps_high = 0.2, 0.3
+    advantage_clip = 2.
+
+    loss = hpo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        eps_clip = (eps_low, eps_high),
+        advantage_clip = advantage_clip,
+        per_action_dim = True
+    )
+
+    adv = advantages[..., None]
+    eps = torch.where(adv >= 0., eps_high, eps_low)
+
+    target = eps * adv.clamp(-advantage_clip, advantage_clip)
+    error = action_log_probs - target
+    abs_error = error.abs()
+    huber = torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)
+
+    expected = (adv.abs() * huber).mean(dim = -1)
+
+    assert torch.allclose(loss, expected)
+
+def test_hpo_per_action_dim_matches_reference_gradient():
+    advantages = tensor([
+        [1., -2., 0.5],
+        [2., -1., 0.25]
+    ])
+
+    log_probs = torch.zeros(2, 3, 4, requires_grad = True)
+
+    hpo_actor_loss(
+        log_probs,
+        torch.zeros_like(log_probs),
+        advantages,
+        per_action_dim = True
+    ).sum().backward()
+
+    # preserves 1-sigma huber gate (quadratic below 1, linear above) and divides gradient across dims
+
+    expected = -(advantages * advantages.abs().clamp(max = 1.)).div(log_probs.shape[-1])
+
+    assert torch.allclose(log_probs.grad, expected[..., None])
+

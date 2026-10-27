@@ -63,6 +63,24 @@ def prepare_advantages(
 
     return advantages, stats, skip_update
 
+# per action dim - keep per-dim log probs, otherwise sum to the usual joint log prob
+
+def resolve_action_dims(
+    action_log_probs,
+    old_action_log_probs,
+    advantages,
+    per_action_dim = False
+):
+    has_action_dim = action_log_probs.ndim == (advantages.ndim + 1)
+
+    if not has_action_dim:
+        return action_log_probs, old_action_log_probs, advantages, False
+
+    if not per_action_dim:
+        return action_log_probs.sum(dim = -1), old_action_log_probs.sum(dim = -1), advantages, False
+
+    return action_log_probs, old_action_log_probs, advantages[..., None], True
+
 @force_fp32
 def ppo_actor_loss(
     action_log_probs,
@@ -76,6 +94,7 @@ def ppo_actor_loss(
     dual_clip = False,
     dual_clip_threshold = 3.,
     log_ratio_clamp = None,
+    per_action_dim = False,
     group_dim = -2,
     min_advantage_std = None,
     return_stats = False
@@ -88,6 +107,13 @@ def ppo_actor_loss(
         normalize = normalize_advantages,
         return_stats = return_stats,
         min_std = min_advantage_std
+    )
+
+    action_log_probs, old_action_log_probs, advantages, has_action_dim = resolve_action_dims(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        per_action_dim = per_action_dim
     )
 
     # delightful policy gradient - Ian Osband https://arxiv.org/abs/2603.14608
@@ -113,6 +139,9 @@ def ppo_actor_loss(
         surr = torch.where(advantages < 0, torch.max(surr, dual_clip_threshold * advantages), surr)
 
     loss = -surr
+
+    if has_action_dim:
+        loss = loss.mean(dim = -1)
 
     if exists(mask):
         loss = masked_mean(loss, mask = mask)
