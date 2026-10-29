@@ -470,3 +470,27 @@ Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(los
     url     = {https://arxiv.org/abs/2604.06159}
 }
 ```
+
+```bibtex
+@misc{schwarzer2021dataefficientreinforcementlearningselfpredictive,
+    title   = {Data-Efficient Reinforcement Learning with Self-Predictive Representations},
+    author  = {Max Schwarzer and Ankesh Anand and Rishab Goel and R Devon Hjelm and Aaron Courville and Philip Bachman},
+    year    = {2021},
+    eprint  = {2007.05929},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2007.05929},
+}
+```
+
+```bibtex
+@misc{teoh2026nextlatentpredictiontransformerslearn,
+    title   = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year    = {2026},
+    eprint  = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.05963},
+}
+```
