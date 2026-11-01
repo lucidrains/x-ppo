@@ -11,6 +11,8 @@ from torch_einops_utils import lens_to_mask, z_score
 
 from x_ppo import (
     DaggerDistiller,
+    NextLatentQCritic,
+    QCriticLosses,
     kl_loss,
     mse_loss,
     nll_loss,
@@ -1916,4 +1918,335 @@ def test_hpo_per_action_dim_matches_reference_gradient():
     expected = -(advantages * advantages.abs().clamp(max = 1.)).div(log_probs.shape[-1])
 
     assert torch.allclose(log_probs.grad, expected[..., None])
+
+# next-latent Q critic
+
+def test_next_latent_q_critic_shapes_and_gradients():
+    batch, seq, dim_embed, dim_action = 2, 5, 8, 3
+
+    value_net = nn.Sequential(
+        nn.Linear(dim_embed, 32),
+        nn.SiLU(),
+        nn.Linear(32, 1)
+    )
+
+    critic = NextLatentQCritic(
+        value_net,
+        dim_embed = dim_embed,
+        dim_action = dim_action,
+        action_embed_dim = 4,
+        hidden_dim = 32,
+        depth = 2,
+        gamma = 0.9
+    )
+
+    embeddings = torch.randn(batch, seq, dim_embed)
+    next_embeddings = torch.randn(batch, seq, dim_embed)
+    actions = torch.randn(batch, seq, dim_action)
+    rewards = torch.randn(batch, seq)
+    returns = torch.randn(batch, seq)
+    dones = (torch.rand(batch, seq) > 0.5).float()
+    masks = torch.ones(batch, seq)
+    masks[:, -1] = 0.
+
+    loss, out = critic(
+        embeddings,
+        actions,
+        rewards = rewards,
+        next_embeddings = next_embeddings,
+        returns = returns,
+        dones = dones,
+        masks = masks,
+        return_loss_breakdown = True
+    )
+
+    assert isinstance(out, QCriticLosses)
+    assert out.q_values.shape == (batch, seq)
+    assert out.reward.ndim == out.terminal.ndim == out.next_latent.ndim == 0
+    assert critic.next_latents(embeddings, actions).shape == (batch, seq, dim_embed)
+    assert critic.predicted_rewards(embeddings, actions).shape == (batch, seq)
+    assert critic.predicted_dones(embeddings, actions).shape == (batch, seq)
+    assert torch.isfinite(loss)
+
+    loss.backward()
+
+    for module in (value_net, critic.action_embed, critic.net, critic.to_reward, critic.to_done):
+        assert any(param.grad is not None for param in module.parameters())
+
+def test_q_critic_can_train_on_imagined_transitions():
+    batch, dim_embed, dim_action = 4, 8, 3
+
+    critic = NextLatentQCritic(
+        nn.Linear(dim_embed, 1),
+        dim_embed = dim_embed,
+        dim_action = dim_action,
+        action_embed_dim = 4,
+        hidden_dim = 32,
+        depth = 2
+    )
+
+    embeddings = torch.randn(batch, dim_embed)
+    next_embeddings = torch.randn(batch, dim_embed)
+    actions = torch.randn(batch, dim_action)
+
+    loss, out = critic(
+        embeddings,
+        actions,
+        next_embeddings = next_embeddings,
+        return_loss_breakdown = True
+    )
+
+    # no reward / done targets, so the Q backup uses the predicted heads
+
+    assert out.reward.item() == 0. and out.terminal.item() == 0.
+    assert out.q >= 0.
+    assert torch.isfinite(loss)
+
+    loss.backward()
+    assert any(param.grad is not None for param in critic.net.parameters())
+
+def test_filter_actions_picks_highest_q():
+    batch, num_candidates, dim_embed, dim_action = 4, 2, 8, 3
+
+    critic = NextLatentQCritic(
+        nn.Linear(dim_embed, 1),
+        dim_embed = dim_embed,
+        dim_action = dim_action,
+        action_embed_dim = 4,
+        hidden_dim = 32,
+        depth = 2
+    )
+
+    embeddings = torch.randn(batch, dim_embed)
+    candidates = torch.randn(batch, num_candidates, dim_action)
+
+    q_values = critic.q_values(
+        embeddings[:, None].expand(-1, num_candidates, -1),
+        candidates
+    )
+
+    filtered = critic.filter_actions(embeddings, candidates)
+
+    assert torch.equal(filtered.indices, q_values.argmax(dim = -1))
+    assert torch.allclose(filtered.actions, candidates[torch.arange(batch), filtered.indices])
+    assert torch.allclose(filtered.q_values, q_values)
+
+# toy corridor for the end-to-end Q filtering test
+
+_Q_CORRIDOR_LEN = 6
+_Q_HORIZON = _Q_CORRIDOR_LEN
+_Q_GAMMA = 0.99
+_Q_P_RIGHT = 0.7
+_Q_STEP = 1. / _Q_CORRIDOR_LEN
+
+def _q_sample_action(num_samples = 1):
+    return torch.where(torch.rand(num_samples) < _Q_P_RIGHT, 1., -1.)
+
+def _q_transition(x, action):
+    next_x = min(max(x + _Q_STEP * action, 0.), 1.)
+    reward = tensor(float(next_x >= 1. - 1e-6))
+    done = reward > 0.5
+    return next_x, reward, done
+
+def _q_make_dataset(num_episodes = 2000):
+    xs, actions, rewards, next_xs, dones, returns = [], [], [], [], [], []
+
+    for _ in range(num_episodes):
+        x = 0.
+        episode = []
+
+        for _ in range(_Q_HORIZON):
+            action = _q_sample_action().item()
+            next_x, reward, done = _q_transition(x, action)
+            episode.append((x, action, reward.item(), next_x, done.item()))
+            x = next_x
+
+            if done:
+                break
+
+        ret = 0.
+        episode_returns = []
+
+        for _, _, reward, _, done in reversed(episode):
+            ret = reward + _Q_GAMMA * ret * (0. if done else 1.)
+            episode_returns.append(ret)
+
+        for (x, action, reward, next_x, done), ret in zip(episode, reversed(episode_returns)):
+            xs.append([x])
+            actions.append([action])
+            rewards.append(reward)
+            next_xs.append([next_x])
+            dones.append(done)
+            returns.append(ret)
+
+    to_tensor = lambda values: torch.tensor(values, dtype = torch.float32)
+
+    return dict(
+        embeddings = to_tensor(xs),
+        actions = to_tensor(actions),
+        rewards = to_tensor(rewards),
+        next_embeddings = to_tensor(next_xs),
+        dones = to_tensor(dones),
+        returns = to_tensor(returns)
+    )
+
+def _q_value_net():
+    return nn.Sequential(
+        nn.Linear(1, 64),
+        nn.SiLU(),
+        nn.Linear(64, 64),
+        nn.SiLU(),
+        nn.Linear(64, 1)
+    )
+
+def _q_train_toy_critic(
+    num_episodes = 2000,
+    train_steps = 1500,
+    batch_size = 256,
+    lr = 3e-3,
+    seed = 0
+):
+    torch.manual_seed(seed)
+
+    data = _q_make_dataset(num_episodes)
+    critic = NextLatentQCritic(
+        _q_value_net(),
+        dim_embed = 1,
+        dim_action = 1,
+        action_embed_dim = 16,
+        hidden_dim = 128,
+        depth = 2,
+        gamma = _Q_GAMMA
+    )
+
+    optimizer = torch.optim.Adam(critic.parameters(), lr = lr)
+    num_transitions = data['embeddings'].shape[0]
+
+    for _ in range(train_steps):
+        indices = torch.randint(num_transitions, (batch_size,))
+        batch = {key: value[indices] for key, value in data.items()}
+
+        loss = critic(
+            batch['embeddings'],
+            batch['actions'],
+            rewards = batch['rewards'],
+            next_embeddings = batch['next_embeddings'],
+            returns = batch['returns'],
+            dones = batch['dones']
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return critic, data
+
+@torch.no_grad()
+def _q_evaluate(
+    critic,
+    mode = 'filter',              # 'sample' | 'filter' | 'greedy'
+    num_candidates = 2,
+    num_episodes = 1000,
+    seed = 1
+):
+    torch.manual_seed(seed)
+
+    successes = 0
+    total_return = 0.
+    total_steps = 0
+
+    for _ in range(num_episodes):
+        x = 0.
+        episode_return = 0.
+
+        for step in range(_Q_HORIZON):
+            if mode == 'greedy':
+                candidates = tensor([[-1.], [1.]])
+                action = critic.filter_actions(tensor([[x]]), candidates[None]).actions[0, 0].item()
+            elif mode == 'filter':
+                candidates = _q_sample_action(num_candidates)[:, None]
+                action = critic.filter_actions(tensor([[x]]), candidates[None]).actions[0, 0].item()
+            else:
+                action = _q_sample_action().item()
+
+            x, reward, done = _q_transition(x, action)
+            episode_return += _Q_GAMMA ** step * reward.item()
+
+            if done:
+                successes += 1
+                break
+
+        total_return += episode_return
+        total_steps += step + 1
+
+    return dict(
+        success = successes / num_episodes,
+        return_ = total_return / num_episodes,
+        steps = total_steps / num_episodes
+    )
+
+@torch.no_grad()
+def _q_table(critic):
+    states = torch.arange(_Q_CORRIDOR_LEN, dtype = torch.float32)[:, None] / _Q_CORRIDOR_LEN
+    right = torch.ones_like(states)
+    left = -torch.ones_like(states)
+
+    return dict(
+        states = states.squeeze(-1),
+        values = critic.forward_value(states),
+        q_right = critic.q_values(states, right),
+        q_left = critic.q_values(states, left),
+        reward_right = critic.predicted_rewards(states, right),
+        done_right = critic.predicted_dones(states, right)
+    )
+
+def test_e2e_q_critic_train_then_filter_actions():
+    critic, data = _q_train_toy_critic(num_episodes = 2000, train_steps = 1500, seed = 0)
+    table = _q_table(critic)
+
+    print()
+    print(f'trained on {data["embeddings"].shape[0]} transitions')
+    print()
+    print('state      V(s)   Q(s, left)  Q(s, right)   r\' right   p(done) right')
+    print('---------------------------------------------------------------------')
+
+    for i in range(_Q_CORRIDOR_LEN):
+        print(
+            f'{table["states"][i].item():5.2f}  '
+            f'{table["values"][i].item():7.3f}  '
+            f'{table["q_left"][i].item():10.3f}  '
+            f'{table["q_right"][i].item():11.3f}  '
+            f'{table["reward_right"][i].item():11.3f}  '
+            f'{table["done_right"][i].item():14.3f}'
+        )
+
+    sampled = _q_evaluate(critic, mode = 'sample', num_episodes = 1000, seed = 1)
+    filtered = _q_evaluate(critic, mode = 'filter', num_episodes = 1000, seed = 1)
+    greedy = _q_evaluate(critic, mode = 'greedy', num_episodes = 1000, seed = 1)
+
+    print()
+    print('inference')
+    print('---------')
+    print('policy sample (K = 1)         ', sampled)
+    print('Q filter (K = 2)              ', filtered)
+    print('greedy Q (K = 2 exhaustive)   ', greedy)
+
+    # the heads should have learned the corridor's reward / terminal rules
+
+    states = table['states'][:, None]
+    right = states.new_ones(states.shape)
+
+    pred_rewards = critic.predicted_rewards(states, right)
+    pred_dones = critic.predicted_dones(states, right)
+
+    assert pred_rewards[-1] > 0.9
+    assert pred_rewards[:-1].abs().max() < 0.1
+    assert pred_dones[-1] > 0.9
+    assert pred_dones[:-1].max() < 0.1
+
+    # filtering two policy samples should clearly beat sampling once
+
+    assert greedy['success'] > 0.9
+    assert filtered['success'] > sampled['success'] + 0.25
+    assert filtered['return_'] > sampled['return_'] + 0.25
 
