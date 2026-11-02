@@ -17,6 +17,8 @@ from x_ppo import (
     mse_loss,
     nll_loss,
     ppo_actor_loss,
+    soft_exit_loss,
+    soft_exit_weights,
     spo_actor_loss,
     hpo_actor_loss,
     calc_gae,
@@ -2005,6 +2007,57 @@ def test_q_critic_can_train_on_imagined_transitions():
     loss.backward()
     assert any(param.grad is not None for param in critic.net.parameters())
 
+def test_q_critic_next_values_override():
+    torch.manual_seed(0)
+
+    batch, seq, dim_embed, dim_action = 2, 3, 4, 2
+
+    critic = NextLatentQCritic(
+        nn.Linear(dim_embed, 1),
+        dim_embed = dim_embed,
+        dim_action = dim_action,
+        action_embed_dim = 3,
+        hidden_dim = 8,
+        depth = 1,
+        gamma = 0.9
+    )
+
+    embeddings = torch.randn(batch, seq, dim_embed)
+    actions = torch.randn(batch, seq, dim_action)
+    rewards = torch.randn(batch, seq)
+    next_values = torch.randn(batch, seq)
+    masks = torch.ones(batch, seq)
+    dones = torch.zeros(batch, seq)
+
+    _, out = critic(
+        embeddings,
+        actions,
+        rewards = rewards,
+        next_values = next_values,
+        masks = masks,
+        dones = dones,
+        return_loss_breakdown = True
+    )
+
+    expected_target = rewards + 0.9 * next_values
+    expected_q = F.smooth_l1_loss(out.q_values, expected_target)
+
+    assert torch.allclose(out.q, expected_q)
+
+    # trailing singleton is accepted
+
+    _, out = critic(
+        embeddings,
+        actions,
+        rewards = rewards,
+        next_values = next_values[..., None],
+        masks = masks,
+        dones = dones,
+        return_loss_breakdown = True
+    )
+
+    assert torch.allclose(out.q, expected_q)
+
 def test_filter_actions_picks_highest_q():
     batch, num_candidates, dim_embed, dim_action = 4, 2, 8, 3
 
@@ -2030,6 +2083,94 @@ def test_filter_actions_picks_highest_q():
     assert torch.equal(filtered.indices, q_values.argmax(dim = -1))
     assert torch.allclose(filtered.actions, candidates[torch.arange(batch), filtered.indices])
     assert torch.allclose(filtered.q_values, q_values)
+
+def test_soft_exit_weights_match_softmax():
+    q_values = tensor([
+        [1., 2., 3.],
+        [0., 0., 0.]
+    ])
+
+    weights = soft_exit_weights(q_values, beta = 2.)
+
+    assert torch.allclose(weights, (q_values / 2.).softmax(dim = -1))
+
+def test_soft_exit_loss_matches_manual():
+    torch.manual_seed(0)
+
+    log_probs = torch.randn(4, 5, requires_grad = True)
+    q_values = torch.randn(4, 5)
+
+    loss = soft_exit_loss(log_probs, q_values, beta = 0.7)
+
+    weights = (q_values / 0.7).softmax(dim = -1)
+    expected = -(weights * log_probs).sum(dim = -1).mean()
+
+    assert torch.allclose(loss, expected)
+
+    loss.backward()
+    assert log_probs.grad is not None
+
+def test_soft_exit_hard_limit():
+    q_values = tensor([
+        [0., 1., 2.],
+        [3., 0., 1.]
+    ])
+
+    log_probs = torch.randn(2, 3)
+
+    loss = soft_exit_loss(log_probs, q_values, beta = 1e-6)
+
+    indices = q_values.argmax(dim = -1)
+    expected = -log_probs[torch.arange(2), indices].mean()
+
+    assert torch.allclose(loss, expected, atol = 1e-5)
+
+def test_soft_exit_kl_budget():
+    torch.manual_seed(0)
+
+    q_values = torch.randn(16, 8)
+    target_kl = 0.2
+
+    _, stats = soft_exit_weights(
+        q_values,
+        kl_budget = target_kl,
+        return_stats = True
+    )
+
+    assert stats.kl.shape == (16,)
+    assert (stats.kl <= target_kl + 1e-4).all()
+    assert torch.isfinite(stats.beta).all()
+    assert (stats.ess >= 1.).all()
+    assert (stats.ess <= 8. + 1e-3).all()
+
+def test_soft_exit_mask():
+    q_values = tensor([
+        [1., 2., 3.],
+        [4., 5., 6.]
+    ])
+
+    mask = tensor([
+        [True, True, False],
+        [False, False, True]
+    ])
+
+    log_probs = torch.randn(2, 3)
+
+    loss, stats = soft_exit_loss(
+        log_probs,
+        q_values,
+        beta = 1.,
+        mask = mask,
+        return_stats = True
+    )
+
+    weights = stats.weights
+
+    assert weights[~mask].abs().max() == 0.
+    assert torch.allclose(weights.sum(dim = -1), torch.ones(2))
+
+    expected = -(weights * log_probs.masked_fill(~mask, 0.)).sum(dim = -1).mean()
+    assert torch.allclose(loss, expected)
 
 # toy corridor for the end-to-end Q filtering test
 
