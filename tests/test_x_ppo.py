@@ -371,6 +371,99 @@ def test_gae_terminated_vs_truncated():
     )
     assert torch.allclose(out_trunc.advantages[0, 1], torch.tensor(9.0), atol = 1e-5)
 
+@param('use_terminated', (False, True))
+@param('use_truncated', (False, True))
+def test_gae_boundary_kwargs_match_masks(use_terminated, use_truncated):
+    torch.manual_seed(0)
+    b, t = 2, 6
+    rewards = torch.randn(b, t)
+    values = torch.randn(b, t)
+    next_values = torch.randn(b, t)
+
+    terminated = torch.zeros(b, t, dtype = torch.bool)
+    truncated = torch.zeros(b, t, dtype = torch.bool)
+
+    if use_terminated:
+        terminated[0, 2] = True
+        terminated[1, 4] = True
+
+    if use_truncated:
+        truncated[0, 3] = True
+        truncated[1, 5] = True
+
+    kwargs = dict(gamma = 0.99, lam = 0.95, next_values = next_values, use_accelerated = False, return_advantages = True)
+
+    direct = calc_gae(
+        rewards, values,
+        terminated = terminated if use_terminated else None,
+        truncated = truncated if use_truncated else None,
+        **kwargs
+    )
+
+    if use_terminated or use_truncated:
+        boundary_masks = dones_to_masks(
+            terminated = terminated if use_terminated else None,
+            truncated = truncated if use_truncated else None
+        )
+        masks, done_masks = boundary_masks if isinstance(boundary_masks, tuple) else (boundary_masks, boundary_masks)
+    else:
+        masks = done_masks = None
+
+    manual = calc_gae(rewards, values, masks = masks, done_masks = done_masks, **kwargs)
+
+    assert torch.allclose(direct.returns, manual.returns, atol = 1e-6)
+    assert torch.allclose(direct.advantages, manual.advantages, atol = 1e-6)
+
+def test_gae_boundary_kwargs_single_sequence():
+    t = 6
+    rewards = torch.randn(t)
+    values = torch.randn(t)
+    next_values = torch.randn(t)
+
+    terminated = torch.tensor([False, False, True, False, False, False])
+    truncated = torch.tensor([False, False, False, True, False, False])
+
+    kwargs = dict(gamma = 0.99, lam = 0.95, next_values = next_values, use_accelerated = False, return_advantages = True)
+
+    direct = calc_gae(rewards, values, terminated = terminated, truncated = truncated, **kwargs)
+
+    masks, done_masks = dones_to_masks(terminated, truncated)
+    manual = calc_gae(rewards, values, masks = masks, done_masks = done_masks, **kwargs)
+
+    assert torch.allclose(direct.returns, manual.returns, atol = 1e-6)
+    assert torch.allclose(direct.advantages, manual.advantages, atol = 1e-6)
+
+def test_gae_boundary_kwargs_grouped():
+    b, g, t = 2, 3, 6
+    rewards = torch.randn(b, g, t)
+    values = torch.randn(b, g, t)
+    next_values = torch.randn(b, g, t)
+
+    terminated = torch.zeros(b, t, dtype = torch.bool)
+    truncated = torch.zeros(b, t, dtype = torch.bool)
+    terminated[0, 2] = True
+    truncated[1, 4] = True
+
+    kwargs = dict(gamma = 0.99, lam = 0.95, next_values = next_values, group_dim = -2, use_accelerated = False, return_advantages = True)
+
+    direct = calc_gae(rewards, values, terminated = terminated, truncated = truncated, **kwargs)
+
+    masks, done_masks = dones_to_masks(terminated, truncated)
+    manual = calc_gae(rewards, values, masks = masks, done_masks = done_masks, **kwargs)
+
+    assert torch.allclose(direct.returns, manual.returns, atol = 1e-6)
+    assert torch.allclose(direct.advantages, manual.advantages, atol = 1e-6)
+
+def test_gae_rejects_mixed_boundary_and_mask_kwargs():
+    rewards = torch.randn(2, 4)
+    values = torch.randn(2, 4)
+
+    with pytest.raises(ValueError, match = 'not both'):
+        calc_gae(rewards, values, masks = torch.ones(2, 4), terminated = torch.zeros(2, 4, dtype = torch.bool))
+
+    with pytest.raises(ValueError, match = 'not both'):
+        calc_gae(rewards, values, done_masks = torch.ones(2, 4), truncated = torch.zeros(2, 4, dtype = torch.bool))
+
 # Grouped Advantages (Host-pytorch use case)
 
 def test_grouped_advantages():

@@ -188,9 +188,26 @@ def calc_gae(
     group_reduce: str | Callable = 'mean',
     group_dim: int = -2,
     use_accelerated: bool | None = None,
-    return_advantages: bool = False
+    return_advantages: bool = False,
+    terminated: Tensor | None = None,         # (b n) gymnasium termination - no bootstrap, cut gae
+    truncated: Tensor | None = None           # (b n) gymnasium truncation - bootstrap, cut gae
 ) -> Tensor | GAE:
     device, dtype = rewards.device, rewards.dtype
+
+    # gymnasium signals -> masks
+    # terminated -> no bootstrap, truncated -> bootstrap from the final observation
+
+    if exists(terminated) or exists(truncated):
+        if exists(masks) or exists(done_masks):
+            raise ValueError(
+                'pass either `terminated` / `truncated` (gymnasium) or `masks` / `done_masks` (low-level), not both'
+            )
+
+        truncated = as_tensor(truncated, dtype = torch.bool) if exists(truncated) else None
+        terminated = as_tensor(terminated, dtype = torch.bool) if exists(terminated) else torch.zeros_like(truncated, dtype = torch.bool)
+
+        masks = (~terminated).float()
+        done_masks = (~(terminated | truncated)).float() if exists(truncated) else masks
 
     # handle single sequence input, with no batch dimension
 

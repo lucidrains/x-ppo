@@ -1,6 +1,6 @@
 [project]
 name = "x-ppo"
-version = "0.0.29"
+version = "0.0.30"
 description = "PPO"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
