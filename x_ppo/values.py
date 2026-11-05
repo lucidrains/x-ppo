@@ -5,7 +5,7 @@ import torch
 from torch import Tensor, as_tensor, cat, is_tensor
 import torch.nn.functional as F
 
-from einops import rearrange
+from einops import rearrange, repeat
 import einx
 
 from assoc_scan import AssocScan
@@ -19,7 +19,8 @@ from torch_einops_utils import (
     batched_index_select,
     tree_map_tensor,
     tree_map_tensor_to_device,
-    masked_reduce
+    masked_reduce,
+    exclusive_cumprod
 )
 
 # helpers
@@ -190,8 +191,37 @@ def calc_gae(
     use_accelerated: bool | None = None,
     return_advantages: bool = False,
     terminated: Tensor | None = None,         # (b n) gymnasium termination - no bootstrap, cut gae
-    truncated: Tensor | None = None           # (b n) gymnasium truncation - bootstrap, cut gae
-) -> Tensor | GAE:
+    truncated: Tensor | None = None,          # (b n) gymnasium truncation - bootstrap, cut gae
+    chunk_size: int | tuple[int, ...] | list[int] = 1
+) -> Tensor | GAE | tuple[Tensor | GAE, ...]:
+    if isinstance(chunk_size, (tuple, list)):
+        return tuple(
+            calc_gae(
+                rewards = rewards,
+                values = values,
+                masks = masks,
+                gamma = gamma,
+                lam = lam,
+                done_masks = done_masks,
+                next_value = next_value,
+                next_values = next_values,
+                lens = lens,
+                weights = weights,
+                normalize_grouped = normalize_grouped,
+                group_reduce = group_reduce,
+                group_dim = group_dim,
+                use_accelerated = use_accelerated,
+                return_advantages = return_advantages,
+                terminated = terminated,
+                truncated = truncated,
+                chunk_size = k
+            )
+            for k in chunk_size
+        )
+
+    if chunk_size < 1:
+        raise ValueError(f'chunk_size must be >= 1, got {chunk_size}')
+
     device, dtype = rewards.device, rewards.dtype
 
     # gymnasium signals -> masks: terminated cuts bootstrap, truncated bootstraps from final state
@@ -241,6 +271,22 @@ def calc_gae(
         (values, next_values, masks, done_masks, gamma, lam, lens),
         device
     )
+
+    if chunk_size > 1:
+        num_chunks = seq_len // chunk_size
+        if num_chunks < 1:
+            raise ValueError(f'sequence length ({seq_len}) must be at least chunk_size ({chunk_size})')
+
+        if values.shape[-1] in (num_chunks, num_chunks + 1) and num_chunks != seq_len:
+            if values.shape[-1] == num_chunks + 1 and not exists(next_value):
+                next_value = values[..., -1]
+
+            values = repeat(values[..., :num_chunks], '... c -> ... (c k)', k = chunk_size)
+            seq_len = num_chunks * chunk_size
+            rewards, masks, done_masks, next_values = tuple(
+                t[..., :seq_len] if is_tensor(t) else t
+                for t in (rewards, masks, done_masks, next_values)
+            )
 
     assert values.shape[-1] in (seq_len, seq_len + 1), f'values must have sequence length of {seq_len} or {seq_len + 1}, but received {values.shape[-1]}'
 
@@ -299,7 +345,28 @@ def calc_gae(
     if exists(len_mask):
         delta = delta.masked_fill(~len_mask, 0.)
 
-    gates = as_tensor(gamma * lam * done_masks, device = device, dtype = dtype).expand_as(delta)
+    # chunked gae: fold 1-step TD residuals across macro-chunks of length `chunk_size`
+
+    if chunk_size > 1:
+        trim = num_chunks * chunk_size
+        step_discounts = as_tensor(gamma * done_masks, device = device, dtype = dtype).expand_as(delta)
+
+        delta_chunks, step_discounts = tuple(
+            rearrange(t[..., :trim], '... (c k) -> ... c k', k = chunk_size)
+            for t in (delta, step_discounts)
+        )
+
+        delta = (delta_chunks * exclusive_cumprod(step_discounts)).sum(dim = -1)
+        gates = as_tensor(lam * step_discounts.prod(dim = -1), device = device, dtype = dtype).expand_as(delta)
+        values = values[..., 0:trim:chunk_size]
+
+        if is_tensor(done_masks):
+            done_masks = rearrange(done_masks[..., :trim], '... (c k) -> ... c k', k = chunk_size).prod(dim = -1)
+
+        if exists(len_mask):
+            len_mask = len_mask[..., 0:trim:chunk_size]
+    else:
+        gates = as_tensor(gamma * lam * done_masks, device = device, dtype = dtype).expand_as(delta)
 
     # scan
 

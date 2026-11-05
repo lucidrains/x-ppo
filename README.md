@@ -12,6 +12,9 @@ The phasic part has been removed, repository to be renamed. I do not think it do
 
 ```bash
 $ pip install -r requirements.txt
+
+# or, for the library and example scripts
+$ uv sync --extra examples
 ```
 
 You may need to install `swig`
@@ -60,6 +63,41 @@ loss, stats = ppo_actor_loss(
 )
 
 stats.mean, stats.var
+```
+
+### sequence wise actor loss
+
+GSPO - take the masked mean log ratio of a whole trajectory, clip the resulting sequence ratio, and use one advantage per trajectory
+
+```python
+cumulative_rewards = rewards.sum(dim = -1)
+
+loss = hpo_actor_loss(
+    action_log_probs,                          # (b n)
+    old_action_log_probs,                      # (b n)
+    cumulative_rewards,                        # (b) - one per trajectory
+    mask = masks,                              # (b n)
+    normalize_advantages = True,               # z-score cumulative rewards
+    sequence_wise = True
+)
+```
+
+The same `sequence_wise = True` flag is available on `ppo_actor_loss` and `spo_actor_loss`. Per-token advantages are also accepted and reduced with the same masked mean before use.
+
+```python
+loss = ppo_actor_loss(
+    action_log_probs,
+    old_action_log_probs,
+    advantages,                                # (b n) or (b)
+    mask = masks,
+    sequence_wise = True
+)
+```
+
+`train_sequence_wise.py` is an end-to-end example - full-episode rollouts, z-scored cumulative rewards, sequence ratio clipping
+
+```bash
+$ python train_sequence_wise.py --env_name CartPole-v1 --methods ppo,spo,hpo --episodes 1000
 ```
 
 ### critic loss
@@ -499,5 +537,15 @@ Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(los
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2511.05963},
+}
+```
+
+```bibtex
+@article{Zheng2025GSPO,
+    title   = {Group Sequence Policy Optimization},
+    author  = {Chujie Zheng and Shixuan Liu and Mingze Li and Jianxin Yang and Bowen Yu and Chang Gao and Kai Dang and Yuqiong Liu and Rui Men and An Yang and Jingren Zhou and Junyang Lin},
+    journal = {arXiv preprint arXiv:2507.18071},
+    year    = {2025},
+    url     = {https://arxiv.org/abs/2507.18071}
 }
 ```

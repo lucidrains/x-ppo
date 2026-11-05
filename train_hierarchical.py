@@ -8,6 +8,7 @@
 #   "gymnasium[box2d,other]",
 #   "hl-gauss-pytorch>=0.1.7",
 #   "imageio[ffmpeg]",
+#   "mean-conc-beta>=0.2.7",
 #   "memmap-replay-buffer>=0.1.2",
 #   "numpy",
 #   "torch",
@@ -36,6 +37,8 @@ from einops.layers.torch import Rearrange
 
 import gymnasium as gym
 
+from mean_conc_beta import Beta as MeanConcBeta
+
 from x_ppo import (
     hpo_actor_loss,
     calc_gae,
@@ -47,6 +50,8 @@ from x_ppo import (
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 torch.set_num_threads(4)
+
+LOG_2_PI = float(np.log(2. * np.pi))
 
 # helpers
 
@@ -85,57 +90,22 @@ def resolve_hierarchies(hierarchies: tuple[int, ...] | int) -> tuple[int, ...]:
 def counterfactual_decoder_binding_loss(action_probs):
     return 1. - normalized_categorical_mutual_info(action_probs)
 
+def continuous_binding_loss(means, stds):
+    var = stds.detach().square()
+    var_cond = var.mean(dim = -2)
+    var_mix = var_cond + means.var(dim = -2, unbiased = False)
+    mi = 0.5 * torch.log1p(var_mix / var_cond.clamp_min(1e-8)).mean(dim = -1)
+    return (1. - mi / (mi + 1.)).mean()
+
 def composed_action_coupling_loss(code_probs, action_probs, target_actions):
     composed_probs = einsum(code_probs, action_probs, 'n k, n k a -> n a')
     return F.nll_loss(log(composed_probs), target_actions.long())
 
-# multi-timescale gae
-
-def calc_hierarchical_gae(
-    rewards: Tensor,
-    masks: Tensor,
-    values: Tensor,
-    next_value: Tensor,
-    stride: int = 1,
-    gamma: float = 0.99,
-    lam: float = 0.95
-):
-    if stride == 1:
-        return calc_gae(
-            rewards = rewards,
-            values = values,
-            masks = masks,
-            next_value = next_value,
-            gamma = gamma,
-            lam = lam,
-            use_accelerated = False,
-            return_advantages = True
-        )
-
-    num_chunks = rewards.shape[-1] // stride
-    trim = num_chunks * stride
-
-    reward_chunks = rearrange(rewards[:, :trim], 'b (c k) -> b c k', k = stride)
-    mask_chunks = rearrange(masks[:, :trim], 'b (c k) -> b c k', k = stride)
-    value_chunks = values[:, 0:trim:stride]
-
-    chunk_rewards = torch.zeros_like(value_chunks)
-    chunk_masks = torch.ones_like(value_chunks)
-
-    for step in range(stride):
-        chunk_rewards = chunk_rewards + (gamma ** step) * chunk_masks * reward_chunks[:, :, step]
-        chunk_masks = chunk_masks * mask_chunks[:, :, step]
-
-    return calc_gae(
-        rewards = chunk_rewards,
-        values = value_chunks,
-        masks = chunk_masks,
-        next_value = next_value,
-        gamma = gamma ** stride,
-        lam = lam,
-        use_accelerated = False,
-        return_advantages = True
-    )
+def continuous_action_coupling_loss(code_probs, means, stds, target_actions):
+    q = ((target_actions[:, None] - means) / stds).square()
+    log_comp = (-0.5 * q - stds.log() - 0.5 * LOG_2_PI).sum(dim = -1)
+    log_mix = torch.logsumexp(log(code_probs) + log_comp, dim = -1)
+    return -log_mix.mean()
 
 # simba residual block - https://arxiv.org/abs/2410.09754
 
@@ -252,14 +222,18 @@ class HierarchyLevel(Module):
         is_bottom = False,
         is_top = False,
         num_actions = 4,
+        continuous = False,
         num_internal_actions = 4,
         low_rank = 8,
         num_time_embeds = 4,
+        beta_init_conc = 5.,
+        beta_eps = 1e-5,
         dropout = 0.
     ):
         super().__init__()
         self.is_bottom = is_bottom
         self.is_top = is_top
+        self.continuous = continuous
 
         self.proj_in = nn.Linear(state_dim, dim)
         self.stem = SimBaBlock(dim, dropout = dropout)
@@ -276,11 +250,16 @@ class HierarchyLevel(Module):
         self.upper = SimBaBlock(dim, dropout = dropout)
 
         if is_bottom:
+            out_dim = 2 * num_actions if continuous else num_actions
             self.action_head = nn.Sequential(
                 nn.Linear(dim, dim // 2),
                 nn.SiLU(),
-                nn.Linear(dim // 2, num_actions)
+                nn.Linear(dim // 2, out_dim)
             )
+            if continuous:
+                nn.init.orthogonal_(self.action_head[-1].weight, gain = 0.01)
+                nn.init.zeros_(self.action_head[-1].bias)
+                self.beta = MeanConcBeta(bounds = (-1., 1.), init_conc = beta_init_conc, unimodal = True, eps = beta_eps)
         else:
             self.readout = DiscreteLatentReadout(dim, dim_latent, num_discrete = num_internal_actions)
             self.residual_proj = nn.Linear(dim, dim_latent, bias = False)
@@ -291,7 +270,23 @@ class HierarchyLevel(Module):
         return self.stem(self.proj_in(state))
 
     def to_logits(self, features):
-        return self.action_head(features) if self.is_bottom else self.readout(features)
+        if not self.is_bottom:
+            return self.readout(features)
+
+        out = self.action_head(features)
+        return rearrange(out, '... (a c) -> ... a c', c = 2) if self.continuous else out
+
+    def sample_action(self, out):
+        return self.beta.sample(out) if self.continuous else Categorical(logits = out).sample()
+
+    def action_log_prob(self, out, actions):
+        return self.beta.log_prob(out, actions) if self.continuous else Categorical(logits = out).log_prob(actions)
+
+    def action_entropy(self, out):
+        return self.beta.entropy(out) if self.continuous else Categorical(logits = out).entropy()
+
+    def action_mean(self, out):
+        return self.beta.mean(out) if self.continuous else out.argmax(dim = -1)
 
     def forward(
         self,
@@ -329,6 +324,8 @@ class HierarchicalActor(Module):
         state_dim = 8,
         hidden_dim = 64,
         num_actions = 4,
+        continuous = False,
+        beta_init_conc = 5.,
         num_internal_actions = 4,
         dim_latent = 32,
         low_rank = 8,
@@ -341,6 +338,7 @@ class HierarchicalActor(Module):
 
         self.state_dim = state_dim
         self.num_actions = num_actions
+        self.continuous = continuous
         self.num_internal_actions = num_internal_actions
         self.dim_latent = dim_latent
         self.hierarchies = tuple(hierarchies)
@@ -362,8 +360,11 @@ class HierarchicalActor(Module):
             levels.append(HierarchyLevel(
                 state_dim, dim, dim_latent,
                 is_bottom = is_bottom, is_top = is_top,
-                num_actions = num_actions, num_internal_actions = num_internal_actions,
-                low_rank = low_rank, num_time_embeds = num_time_embeds, dropout = dropout
+                num_actions = num_actions, continuous = continuous,
+                beta_init_conc = beta_init_conc,
+                num_internal_actions = num_internal_actions,
+                low_rank = low_rank, num_time_embeds = num_time_embeds,
+                dropout = dropout
             ))
 
         self.levels = ModuleList(levels)
@@ -377,7 +378,7 @@ class HierarchicalActor(Module):
         shift_higher = self.phase_shifts[level_index + 1]
         return ((timesteps - shift_higher) % stride_higher) // stride_current
 
-    def counterfactual_action_probs(self, state, level_index = 0, time_indices = None, temperature = 0.5):
+    def counterfactual_probe(self, state, level_index = 0, time_indices = None, temperature = 0.5):
         assert 0 <= level_index < self.num_levels - 1
 
         if state.ndim == 1:
@@ -388,20 +389,24 @@ class HierarchicalActor(Module):
         sender = self.levels[level_index + 1]
 
         hidden = receiver.encode_stem(state).detach()
-
-        with torch.no_grad():
-            base_logits = receiver.to_logits(receiver.upper(receiver.steered_norm(hidden)))
-
-        repeated_base_logits = repeat(base_logits, 'b a -> (b k) a', k = num_codes)
         repeated_hidden = repeat(hidden, 'b d -> (b k) d', k = num_codes)
         repeated_time_indices = repeat(time_indices, 'b -> (b k)', k = num_codes) if exists(time_indices) else None
         repeated_prototypes = repeat(sender.readout.prototypes, 'k d -> (b k) d', b = hidden.shape[0])
 
         steered = receiver.steered_norm(repeated_hidden + receiver.from_higher(repeated_hidden, repeated_prototypes, time_indices = repeated_time_indices))
-        steered_logits = receiver.to_logits(receiver.upper(steered))
+        steered_out = receiver.to_logits(receiver.upper(steered))
 
-        delta_probs = ((steered_logits - repeated_base_logits) / temperature).softmax(dim = -1)
-        return rearrange(delta_probs, '(b k) a -> b k a', k = num_codes)
+        if receiver.is_bottom and receiver.continuous:
+            means = receiver.beta.mean(steered_out)
+            stds = receiver.beta(steered_out).stddev
+            return rearrange(means, '(b k) a -> b k a', k = num_codes), rearrange(stds, '(b k) a -> b k a', k = num_codes), None
+
+        with torch.no_grad():
+            base_out = receiver.to_logits(receiver.upper(receiver.steered_norm(hidden)))
+
+        delta_logits = steered_out - repeat(base_out, 'b a -> (b k) a', k = num_codes)
+        probs = (delta_logits / temperature).softmax(dim = -1)
+        return None, None, rearrange(probs, '(b k) a -> b k a', k = num_codes)
 
     def forward_level(
         self,
@@ -479,6 +484,7 @@ class Critic(Module):
 def record_best_episode_video(
     actor: HierarchicalActor,
     env_name: str = 'LunarLander-v3',
+    continuous: bool = False,
     video_folder: str = './lunar-recording',
     video_prefix: str = 'hierarchical-best',
     max_timesteps: int = 600,
@@ -486,7 +492,7 @@ def record_best_episode_video(
     seed: int = 100
 ):
     actor.eval()
-    env = gym.make(env_name, render_mode = 'rgb_array', max_episode_steps = max_timesteps)
+    env = gym.make(env_name, render_mode = 'rgb_array', max_episode_steps = max_timesteps, continuous = continuous)
 
     best_return = -float('inf')
     best_frames = []
@@ -514,8 +520,10 @@ def record_best_episode_video(
 
             base_time_indices = actor.level_time_indices(0, timestep_tensor)
             latent_from_level_one = held_latents[1] if actor.num_levels > 1 else None
-            action_logits = actor.forward_level(0, state, latent_from_higher = latent_from_level_one, time_indices = base_time_indices)
-            action = action_logits.argmax(dim = -1).item()
+            action_out = actor.forward_level(0, state, latent_from_higher = latent_from_level_one, time_indices = base_time_indices)
+
+            action = actor.levels[0].action_mean(action_out)
+            action = action.squeeze(0).cpu().numpy() if actor.continuous else action.item()
 
             obs, reward, terminated, truncated, _ = env.step(action)
             episode_return += float(reward)
@@ -548,6 +556,8 @@ def record_best_episode_video(
 
 def main(
     env_name = 'LunarLander-v3',
+    continuous = False,
+    beta_init_conc = 5.,
     hierarchies: tuple[int, ...] | int = (1, 4, 8),
     phase_shifts: tuple[int, ...] | None = None,
     num_cycles = 4,
@@ -576,7 +586,8 @@ def main(
     seed = 42,
     render = True,
     video_folder = './lunar-recording',
-    save_path = './ppo_hierarchical.pt'
+    save_path = './ppo_hierarchical.pt',
+    log_csv = None
 ):
     hierarchies = resolve_hierarchies(hierarchies)
     num_levels = len(hierarchies)
@@ -585,16 +596,22 @@ def main(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = 'sync', max_episode_steps = max_episode_steps)
+    env = gym.make_vec(
+        env_name, num_envs = num_envs, vectorization_mode = 'sync',
+        max_episode_steps = max_episode_steps, continuous = continuous
+    )
+
     state_dim = env.single_observation_space.shape[0]
-    num_actions = env.single_action_space.n
+    num_actions = env.single_action_space.shape[0] if continuous else int(env.single_action_space.n)
 
     actor = HierarchicalActor(
         state_dim = state_dim, hidden_dim = actor_hidden_dim, num_actions = num_actions,
+        continuous = continuous, beta_init_conc = beta_init_conc,
         num_internal_actions = num_internal_actions, dim_latent = dim_latent,
         low_rank = low_rank, hierarchies = hierarchies, phase_shifts = phase_shifts
     ).to(device)
 
+    base_level = actor.levels[0]
     critic = Critic(state_dim, critic_hidden_dim).to(device)
 
     # level-wise parameter partitioning: each higher level l >= 1 owns its encoder/readout and downward hypernetwork
@@ -641,6 +658,11 @@ def main(
     best_rolling_return = -float('inf')
     best_actor_state = deepcopy(actor.state_dict())
     start_time = time.time()
+    total_env_steps = 0
+
+    if exists(log_csv):
+        with open(log_csv, 'w') as f:
+            f.write('phase_index,phase_label,update_index,env_steps,recent_return_32,update_return,best_rolling_return\n')
 
     for phase_index, (phase, num_updates) in enumerate(phases):
         actor.train()
@@ -666,8 +688,9 @@ def main(
         phase_returns = []
         landed_flags = []
         start_return_32 = float(np.mean(recent_returns[-32:])) if recent_returns else -200.
+        phase_label = f'level {phase} (dt={hierarchies[phase]})' if isinstance(phase, int) else 'all'
 
-        for _ in range(num_updates):
+        for update_index in range(num_updates):
             rollout_states, rollout_actions, rollout_log_probs = [], [], []
             rollout_rewards, rollout_terminated, rollout_truncated = [], [], []
             rollout_internal_actions = [[] for _ in range(num_levels)]
@@ -693,10 +716,9 @@ def main(
                             held_internal_log_probs[level_index] = Categorical(probs = probs).log_prob(sampled_code)
 
                     latent_from_level_one = held_latents[1] if num_levels > 1 else None
-                    action_logits = actor.forward_level(0, state, latent_from_higher = latent_from_level_one, time_indices = step_time_indices[0])
-                    action_dist = Categorical(logits = action_logits)
-                    action = action_dist.sample()
-                    action_log_prob = action_dist.log_prob(action)
+                    level_out = actor.forward_level(0, state, latent_from_higher = latent_from_level_one, time_indices = step_time_indices[0])
+                    action = base_level.sample_action(level_out)
+                    action_log_prob = base_level.action_log_prob(level_out, action)
 
                 next_obs, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 done = terminated | truncated
@@ -725,12 +747,20 @@ def main(
 
                 state = torch.from_numpy(next_obs).float().to(device)
 
+            total_env_steps += rollout_steps * num_envs
+
             if episode_returns:
                 phase_returns.extend(episode_returns)
                 current_rolling_return = float(np.mean(recent_returns[-32:]))
                 if current_rolling_return > best_rolling_return:
                     best_rolling_return = current_rolling_return
                     best_actor_state = deepcopy(actor.state_dict())
+
+            if exists(log_csv):
+                recent_return_32 = float(np.mean(recent_returns[-32:])) if recent_returns else float('nan')
+                update_return = float(np.mean(episode_returns)) if episode_returns else float('nan')
+                with open(log_csv, 'a') as f:
+                    f.write(f'{phase_index + 1},{phase_label},{update_index + 1},{total_env_steps},{recent_return_32:.4f},{update_return:.4f},{best_rolling_return:.4f}\n')
 
             states = stack(rollout_states, dim = 1)
             actions = stack(rollout_actions, dim = 1)
@@ -747,10 +777,17 @@ def main(
             with torch.no_grad():
                 values = critic(states)
                 next_value = critic(state)
-                gae_per_level = {
-                    level_index: calc_hierarchical_gae(rewards, done_masks, values, next_value, stride = hierarchies[level_index], gamma = gamma, lam = lam)
-                    for level_index in range(num_levels)
-                }
+                gae_per_level = calc_gae(
+                    rewards,
+                    values,
+                    masks = done_masks,
+                    next_value = next_value,
+                    gamma = gamma,
+                    lam = lam,
+                    chunk_size = hierarchies,
+                    use_accelerated = False,
+                    return_advantages = True
+                )
 
             for _ in range(epochs):
                 perm = torch.randperm(num_envs, device = device)
@@ -767,7 +804,7 @@ def main(
                     batch_base_advantages = gae_per_level[0].advantages[batch_indices]
 
                     flat_states = rearrange(batch_states, 'b t d -> (b t) d')
-                    flat_actions = rearrange(batch_actions, 'b t -> (b t)')
+                    flat_actions = rearrange(batch_actions, 'b t ... -> (b t) ...')
                     flat_old_log_probs = rearrange(batch_old_log_probs, 'b t -> (b t)')
                     flat_base_advantages = rearrange(batch_base_advantages, 'b t -> (b t)')
                     flat_base_returns = rearrange(batch_base_returns, 'b t -> (b t)')
@@ -812,22 +849,25 @@ def main(
                             rearrange(chunk_latents, '(b c) d -> b c d', b = batch_size), 'b c d -> (b c r) d', r = repeat_factor
                         )
 
-                    action_logits = actor.forward_level(0, flat_states, latent_from_higher = latents_for_lower.get(1, None), time_indices = flat_base_time_indices)
-                    action_dist = Categorical(logits = action_logits)
-                    base_policy_loss = hpo_actor_loss(
-                        action_dist.log_prob(flat_actions), flat_old_log_probs, flat_base_advantages, eps_clip = eps_clip, normalize_advantages = True
-                    ).mean()
+                    level_out = actor.forward_level(0, flat_states, latent_from_higher = latents_for_lower.get(1, None), time_indices = flat_base_time_indices)
+                    if continuous and phase != 0 and phase != 'all':
+                        level_out = stack((level_out[..., 0], level_out[..., 1].detach()), dim = -1)
+
+                    base_log_probs = base_level.action_log_prob(level_out, flat_actions)
+                    base_entropy = base_level.action_entropy(level_out).mean()
+                    base_policy_loss = hpo_actor_loss(base_log_probs, flat_old_log_probs, flat_base_advantages, eps_clip = eps_clip, normalize_advantages = True).mean()
 
                     if phase == 0:
-                        loss = base_policy_loss - entropy_coef * action_dist.entropy().mean()
+                        loss = base_policy_loss - entropy_coef * base_entropy
 
                         if num_levels > 1 and float(actor.levels[1].gate.item()) > 0.:
                             in_flight = (flat_states[:128, 6] + flat_states[:128, 7]) < 1.5 if state_dim >= 8 else torch.ones(min(128, flat_states.shape[0]), dtype = torch.bool, device = device)
                             if in_flight.any():
-                                counterfactual_probs = actor.counterfactual_action_probs(
+                                cf_means, cf_stds, cf_probs = actor.counterfactual_probe(
                                     flat_states[:128][in_flight], level_index = 0, time_indices = flat_base_time_indices[:128][in_flight]
                                 )
-                                loss = loss + 0.5 * binding_loss_weight * aux_scale * counterfactual_decoder_binding_loss(counterfactual_probs)
+                                binding_aux = continuous_binding_loss(cf_means, cf_stds) if continuous else counterfactual_decoder_binding_loss(cf_probs)
+                                loss = loss + 0.5 * binding_loss_weight * aux_scale * binding_aux
 
                         level_optimizers[0].zero_grad()
                         loss.backward()
@@ -846,34 +886,59 @@ def main(
                         chunk_advantages = rearrange(gae_per_level[level_index].advantages[batch_indices], 'b c -> (b c)')
 
                         internal_dist = Categorical(probs = chunk_probs)
-                        level_policy_loss = hpo_actor_loss(
-                            internal_dist.log_prob(chunk_internal_actions), chunk_old_log_probs, chunk_advantages, eps_clip = eps_clip, normalize_advantages = True
-                        ).mean()
+                        level_policy_loss = hpo_actor_loss(internal_dist.log_prob(chunk_internal_actions), chunk_old_log_probs, chunk_advantages, eps_clip = eps_clip, normalize_advantages = True).mean()
 
                         sub_count = min(128, chunk_states.shape[0])
                         in_flight = (chunk_states[:sub_count, 6] + chunk_states[:sub_count, 7]) < 1.5 if state_dim >= 8 else torch.ones(sub_count, dtype = torch.bool, device = device)
                         binding_states = chunk_states[:sub_count][in_flight] if in_flight.any() else chunk_states[:sub_count]
 
-                        counterfactual_bind_probs = actor.counterfactual_action_probs(
+                        lower_is_continuous = continuous and lower_index == 0
+
+                        binding_means, binding_stds, binding_probs = actor.counterfactual_probe(
                             binding_states, level_index = lower_index, time_indices = zeros(binding_states.shape[0], dtype = torch.long, device = device)
                         )
-                        binding_loss = counterfactual_decoder_binding_loss(counterfactual_bind_probs)
+                        binding_loss = continuous_binding_loss(binding_means, binding_stds) if lower_is_continuous else counterfactual_decoder_binding_loss(binding_probs)
 
                         with torch.no_grad():
-                            counterfactual_all_probs = actor.counterfactual_action_probs(
+                            cf_means, cf_stds, cf_probs = actor.counterfactual_probe(
                                 chunk_states, level_index = lower_index, time_indices = zeros(chunk_states.shape[0], dtype = torch.long, device = device)
                             )
 
-                        target_actions = rearrange(batch_actions[:, 0::stride], 'b c -> (b c)') if lower_index == 0 else rearrange(internal_actions[lower_index][batch_indices][:, 0::stride], 'b c -> (b c)')
+                        if lower_index == 0:
+                            target_actions = rearrange(batch_actions[:, 0::stride], 'b c ... -> (b c) ...')
+                        else:
+                            target_actions = rearrange(internal_actions[lower_index][batch_indices][:, 0::stride], 'b c -> (b c)')
+
                         positive_mask = chunk_advantages > 0.
-                        coupling_loss = composed_action_coupling_loss(
-                            chunk_probs[positive_mask], counterfactual_all_probs[positive_mask].detach(), target_actions[positive_mask]
-                        ) if positive_mask.any() else 0.
+
+                        if lower_is_continuous:
+                            coupling_loss = continuous_action_coupling_loss(
+                                chunk_probs[positive_mask], cf_means[positive_mask].detach(), cf_stds[positive_mask].detach(), target_actions[positive_mask]
+                            ) if positive_mask.any() else torch.zeros((), device = device)
+                        else:
+                            coupling_loss = composed_action_coupling_loss(
+                                chunk_probs[positive_mask], cf_probs[positive_mask].detach(), target_actions[positive_mask]
+                            ) if positive_mask.any() else torch.zeros((), device = device)
+
+                        if lower_index == 0:
+                            lower_policy_loss = base_policy_loss
+                            lower_entropy = base_entropy
+                        else:
+                            lower_dist = Categorical(probs = probs_per_level[lower_index])
+                            lower_advantages = rearrange(gae_per_level[lower_index].advantages[batch_indices], 'b c -> (b c)')
+                            lower_policy_loss = 0.5 * base_policy_loss + 0.5 * hpo_actor_loss(
+                                lower_dist.log_prob(chunk_actions_per_level[lower_index]),
+                                chunk_old_log_probs_per_level[lower_index],
+                                lower_advantages,
+                                eps_clip = eps_clip,
+                                normalize_advantages = True
+                            ).mean()
+                            lower_entropy = lower_dist.entropy().mean()
 
                         loss = (
-                            base_policy_loss +
+                            lower_policy_loss +
                             internal_policy_loss_weight * level_policy_loss -
-                            entropy_coef * (action_dist.entropy().mean() + internal_dist.entropy().mean()) +
+                            entropy_coef * (lower_entropy + internal_dist.entropy().mean()) +
                             binding_loss_weight * aux_scale * binding_loss +
                             coupling_loss_weight * aux_scale * coupling_loss
                         )
@@ -884,10 +949,9 @@ def main(
                         level_optimizers[level_index].step()
 
                     elif phase == 'all':
-                        loss = base_policy_loss - entropy_coef * action_dist.entropy().mean()
+                        loss = base_policy_loss - entropy_coef * base_entropy
                         for level_index in range(1, num_levels):
-                            chunk_probs = probs_per_level[level_index]
-                            internal_dist = Categorical(probs = chunk_probs)
+                            internal_dist = Categorical(probs = probs_per_level[level_index])
                             chunk_advantages = rearrange(gae_per_level[level_index].advantages[batch_indices], 'b c -> (b c)')
                             level_policy_loss = hpo_actor_loss(
                                 internal_dist.log_prob(chunk_actions_per_level[level_index]),
@@ -912,7 +976,6 @@ def main(
         end_return_32 = float(np.mean(recent_returns[-32:])) if recent_returns else -200.
         phase_mean_return = float(np.mean(phase_returns)) if phase_returns else end_return_32
         landed_percent = 100. * float(np.mean(landed_flags)) if landed_flags else 0.
-        phase_label = f'level {phase} (dt={hierarchies[phase]})' if isinstance(phase, int) else 'all'
         print(
             f'Phase {phase_index + 1:2d} [{phase_label:14s}]: '
             f'mean = {phase_mean_return:+6.1f} | start32 = {start_return_32:+6.1f} -> end32 = {end_return_32:+6.1f} '
@@ -923,10 +986,15 @@ def main(
     env.close()
 
     actor.load_state_dict(best_actor_state)
-    torch.save({'actor': actor.state_dict(), 'critic': critic.state_dict(), 'hierarchies': hierarchies}, save_path)
+    torch.save({
+        'actor': actor.state_dict(),
+        'critic': critic.state_dict(),
+        'hierarchies': hierarchies,
+        'continuous': continuous
+    }, save_path)
 
     if render:
-        record_best_episode_video(actor, env_name = env_name, video_folder = video_folder, max_timesteps = max_episode_steps)
+        record_best_episode_video(actor, env_name = env_name, continuous = continuous, video_folder = video_folder, max_timesteps = max_episode_steps)
 
 if __name__ == '__main__':
     fire.Fire(main)

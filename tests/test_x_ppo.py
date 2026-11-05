@@ -2484,3 +2484,170 @@ def test_e2e_q_critic_train_then_filter_actions():
     assert filtered['success'] > sampled['success'] + 0.25
     assert filtered['return_'] > sampled['return_'] + 0.25
 
+# multi-temporal chunked GAE (hierarchical semi-MDP)
+
+@param('chunk_size', (1, 2, 4, 8))
+def test_gae_chunked(chunk_size):
+    torch.manual_seed(0)
+
+    b, t = 3, 18
+    rewards = torch.randn(b, t)
+    values = torch.randn(b, t)
+    masks = (torch.rand(b, t) > 0.15).float()
+    next_value = torch.randn(b)
+    gamma, lam = 0.99, 0.95
+
+    out = calc_gae(
+        rewards,
+        values,
+        masks = masks,
+        next_value = next_value,
+        gamma = gamma,
+        lam = lam,
+        chunk_size = chunk_size,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    num_chunks = t // chunk_size
+    trim = num_chunks * chunk_size
+
+    chunk_rewards = torch.zeros(b, num_chunks)
+    chunk_masks = torch.ones(b, num_chunks)
+
+    for step in range(chunk_size):
+        chunk_rewards = chunk_rewards + (gamma ** step) * chunk_masks * rewards[:, step:trim:chunk_size]
+        chunk_masks = chunk_masks * masks[:, step:trim:chunk_size]
+
+    bootstrap = values[:, trim] if trim < t else next_value
+    expected = calc_gae(
+        chunk_rewards,
+        values[:, 0:trim:chunk_size],
+        masks = chunk_masks,
+        next_value = bootstrap,
+        gamma = gamma ** chunk_size,
+        lam = lam,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    assert out.returns.shape == (b, num_chunks)
+    assert out.advantages.shape == (b, num_chunks)
+    assert torch.allclose(out.returns, expected.returns, atol = 1e-5)
+    assert torch.allclose(out.advantages, expected.advantages, atol = 1e-5)
+
+    # pre-subsampled chunk values (b, num_chunks) also work seamlessly
+
+    out_pre_chunked = calc_gae(
+        rewards[:, :trim],
+        values[:, 0:trim:chunk_size],
+        masks = masks[:, :trim],
+        next_value = bootstrap,
+        gamma = gamma,
+        lam = lam,
+        chunk_size = chunk_size,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    assert torch.allclose(out_pre_chunked.returns, expected.returns, atol = 1e-5)
+    assert torch.allclose(out_pre_chunked.advantages, expected.advantages, atol = 1e-5)
+
+def test_gae_chunked_mid_chunk_termination_and_bootstrap():
+    # 2 chunks of length 4 (8 steps total), testing mid-chunk termination vs mid-chunk truncation (bootstrap)
+
+    gamma, lam, chunk_size = 0.9, 0.95, 4
+    rewards = torch.tensor([[1., 2., 100., 200., 3., 4., 5., 6.]])
+    values = torch.tensor([[0.5, 1.5, 99., 99., 1., 1., 1., 1.]])
+    next_values = torch.tensor([[1.5, 10., 99., 1., 1., 1., 1., 2.]])
+
+    # 1. mid-chunk termination at step 1 (inside chunk 0):
+    #    - no bootstrap at step 1
+    #    - steps 2, 3 (post-reset garbage 100., 200.) are zeroed out by exclusive_cumprod
+    #    - GAE recurrence from chunk 1 is cut
+
+    terminated = torch.tensor([[False, True, False, False, False, False, False, False]])
+    out_term = calc_gae(
+        rewards,
+        values,
+        terminated = terminated,
+        next_values = next_values,
+        gamma = gamma,
+        lam = lam,
+        chunk_size = chunk_size,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    expected_term_return_c0 = 1. + gamma * 2.
+    assert torch.allclose(out_term.returns[0, 0], torch.tensor(expected_term_return_c0), atol = 1e-5)
+    assert torch.allclose(out_term.advantages[0, 0], torch.tensor(expected_term_return_c0 - 0.5), atol = 1e-5)
+
+    # 2. mid-chunk truncation at step 1 (inside chunk 0):
+    #    - bootstraps gamma^2 * next_values[0, 1] = 0.81 * 10. at step 1
+    #    - steps 2, 3 are zeroed out by exclusive_cumprod
+    #    - GAE recurrence from chunk 1 is cut
+
+    truncated = torch.tensor([[False, True, False, False, False, False, False, False]])
+    out_trunc = calc_gae(
+        rewards,
+        values,
+        truncated = truncated,
+        next_values = next_values,
+        gamma = gamma,
+        lam = lam,
+        chunk_size = chunk_size,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    expected_trunc_return_c0 = 1. + gamma * 2. + (gamma ** 2) * 10.
+    assert torch.allclose(out_trunc.returns[0, 0], torch.tensor(expected_trunc_return_c0), atol = 1e-5)
+    assert torch.allclose(out_trunc.advantages[0, 0], torch.tensor(expected_trunc_return_c0 - 0.5), atol = 1e-5)
+
+def test_gae_multi_temporal_hierarchy_usage_example():
+    # usage example: 3-level hierarchical actor acting at chunk sizes (1, 4, 8) over a 16-step rollout
+
+    batch, seq_len = 4, 16
+    hierarchies = (1, 4, 8)
+
+    rewards = torch.randn(batch, seq_len)
+    values = torch.randn(batch, seq_len)
+    terminated = torch.zeros(batch, seq_len, dtype = torch.bool)
+    truncated = torch.zeros(batch, seq_len, dtype = torch.bool)
+    terminated[0, 5] = True
+    truncated[1, 11] = True
+    next_value = torch.randn(batch)
+
+    # single call returns (GAE_chunk_1, GAE_chunk_4, GAE_chunk_8)
+
+    gae_per_level = calc_gae(
+        rewards,
+        values,
+        terminated = terminated,
+        truncated = truncated,
+        next_value = next_value,
+        gamma = 0.99,
+        lam = 0.95,
+        chunk_size = hierarchies,
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    assert len(gae_per_level) == len(hierarchies)
+
+    for chunk_size, level_gae in zip(hierarchies, gae_per_level):
+        num_chunks = seq_len // chunk_size
+        assert level_gae.returns.shape == (batch, num_chunks)
+        assert level_gae.advantages.shape == (batch, num_chunks)
+
+        # each hierarchy level optimizes its chunked actions against its semi-MDP advantages
+
+        log_probs = torch.randn(batch, num_chunks, requires_grad = True)
+        old_log_probs = log_probs.detach()
+
+        loss = hpo_actor_loss(log_probs, old_log_probs, level_gae.advantages).mean()
+        loss.backward()
+        assert log_probs.grad is not None
+
+

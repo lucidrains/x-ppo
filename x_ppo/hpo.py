@@ -1,7 +1,7 @@
 import torch
 from torch_einops_utils import masked_mean
 
-from x_ppo.ppo import cast_tuple, force_fp32, exists, prepare_advantages, resolve_action_dims
+from x_ppo.ppo import cast_tuple, exists, force_fp32, prepare_actor_inputs
 from x_ppo.values import resolve_grouped_mask
 
 @force_fp32
@@ -19,30 +19,28 @@ def hpo_actor_loss(
     per_action_dim = False,
     group_dim = -2,
     min_advantage_std = 1e-6,
-    return_stats = False
+    return_stats = False,
+    sequence_wise = False
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
 
-    advantages, stats, skip_update = prepare_advantages(
-        advantages,
-        mask = mask,
-        normalize = normalize_advantages,
-        return_stats = return_stats,
-        min_std = min_advantage_std
-    )
-
-    action_log_probs, old_action_log_probs, advantages, has_action_dim = resolve_action_dims(
+    inputs = prepare_actor_inputs(
         action_log_probs,
         old_action_log_probs,
         advantages,
-        per_action_dim = per_action_dim
+        mask = mask,
+        normalize_advantages = normalize_advantages,
+        delightful = delightful,
+        delight_temp = delight_temp,
+        per_action_dim = per_action_dim,
+        sequence_wise = sequence_wise,
+        min_advantage_std = min_advantage_std,
+        return_stats = return_stats
     )
 
-    if delightful:
-        gate = (-action_log_probs * advantages / delight_temp).sigmoid().detach()
-        advantages = advantages * gate
+    log_ratios = inputs.log_ratios
+    advantages = inputs.advantages
 
-    log_ratios = action_log_probs - old_action_log_probs
     eps_clip_low, eps_clip_high = cast_tuple(eps_clip, 2)
 
     if exists(log_ratio_clamp):
@@ -68,13 +66,13 @@ def hpo_actor_loss(
     abs_error = error.abs()
     loss = weight * torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)
 
-    if has_action_dim:
+    if inputs.has_action_dim:
         loss = loss.mean(dim = -1)
 
-    if exists(mask):
-        loss = masked_mean(loss, mask = mask)
+    if exists(inputs.mask):
+        loss = masked_mean(loss, mask = inputs.mask)
 
-    if skip_update:
+    if inputs.skip_update:
         loss = loss * 0.
 
-    return (loss, stats) if return_stats else loss
+    return (loss, inputs.stats) if return_stats else loss

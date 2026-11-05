@@ -1,6 +1,6 @@
 [project]
 name = "x-ppo"
-version = "0.0.30"
+version = "0.0.31"
 description = "PPO"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,7 @@ dependencies = [
     "einops>=0.8.0",
     "einx>=0.4.0",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.42",
+    "torch-einops-utils>=0.2.5",
 ]
 
 [project.urls]
@@ -36,7 +36,14 @@ Homepage = "https://pypi.org/project/x-ppo/"
 Repository = "https://github.com/lucidrains/x-ppo"
 
 [project.optional-dependencies]
-examples = ["mean-conc-beta"]
+examples = [
+    "fire",
+    "gymnasium[box2d]>=1.0.0",
+    "imageio[ffmpeg]",
+    "matplotlib",
+    "mean-conc-beta",
+    "numpy",
+]
 test = [
     "pytest"
 ]
