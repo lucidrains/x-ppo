@@ -194,8 +194,7 @@ def calc_gae(
 ) -> Tensor | GAE:
     device, dtype = rewards.device, rewards.dtype
 
-    # gymnasium signals -> masks
-    # terminated -> no bootstrap, truncated -> bootstrap from the final observation
+    # gymnasium signals -> masks: terminated cuts bootstrap, truncated bootstraps from final state
 
     if exists(terminated) or exists(truncated):
         if exists(masks) or exists(done_masks):
