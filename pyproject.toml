@@ -43,6 +43,8 @@ examples = [
     "matplotlib",
     "mean-conc-beta",
     "numpy",
+    "pandas",
+    "seaborn",
 ]
 test = [
     "pytest"
