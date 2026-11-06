@@ -269,6 +269,51 @@ def test_gae_matches_sequential():
     assert torch.allclose(out.returns, expected_returns, atol = 1e-5)
     assert torch.allclose(out.advantages, expected_advantages, atol = 1e-5)
 
+# finite-time GAE
+
+def test_finite_time_gae():
+    torch.manual_seed(0)
+
+    b, t = 3, 10
+    rewards = torch.randn(b, t)
+    values = torch.randn(b, t)
+    masks = torch.tensor([
+        [1., 1., 1., 0., 1., 1., 1., 1., 1., 0.],
+        [1., 1., 1., 1., 1., 1., 1., 0., 1., 1.],
+        [1., 0., 1., 1., 1., 1., 0., 1., 1., 1.]
+    ])
+    next_val = torch.randn(b)
+    gamma = 0.99
+
+    v_next = cat((values[:, 1:], next_val[:, None]), dim = 1)
+    deltas = rewards + gamma * v_next * masks - values
+
+    horizons = torch.zeros_like(rewards)
+    h = torch.zeros(b)
+
+    for step in reversed(range(t)):
+        h = 1. + masks[:, step] * h
+        horizons[:, step] = h
+
+    for lam in (0.95, 1., 1.1):
+        ratios = (horizons - 1.) / horizons if lam == 1. else (1. - lam ** (horizons - 1.)) / (1. - lam ** horizons)
+
+        expected = torch.zeros_like(rewards)
+        advantage = torch.zeros(b)
+
+        for step in reversed(range(t)):
+            advantage = deltas[:, step] + gamma * lam * masks[:, step] * ratios[:, step] * advantage
+            expected[:, step] = advantage
+
+        out = calc_gae(
+            rewards, values, masks,
+            gamma = gamma, lam = lam, next_value = next_val,
+            finite_time = True, use_accelerated = False, return_advantages = True
+        )
+
+        assert torch.allclose(out.returns, expected + values, atol = 1e-5)
+        assert torch.allclose(out.advantages, expected, atol = 1e-5)
+
 # Shapes: 1D, 2D, 3D
 
 @param('shape', [(8,), (2, 8), (2, 3, 8)])

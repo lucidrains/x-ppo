@@ -401,6 +401,7 @@ class PPO(Module):
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
+        finite_time_gae = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -455,6 +456,7 @@ class PPO(Module):
 
         self.lam = lam
         self.gamma = gamma
+        self.finite_time_gae = finite_time_gae
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
@@ -517,6 +519,7 @@ class PPO(Module):
                 masks = tensor(masks).to(device),
                 lam = self.lam,
                 gamma = self.gamma,
+                finite_time = self.finite_time_gae,
                 use_accelerated = False
             )
 
@@ -630,6 +633,7 @@ def main(
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
+    finite_time_gae = False,
     eps_clip = 0.2,
     beta_s = .01,
     regen_reg_rate = 1e-4,
@@ -696,6 +700,7 @@ def main(
         ema_decay,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,
+        finite_time_gae = finite_time_gae,
     ).to(device)
 
     if load:

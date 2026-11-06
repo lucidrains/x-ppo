@@ -172,6 +172,25 @@ def reverse_assoc_scan(
 
     return inverse_pack(scan(gates, inputs))
 
+# finite-time gae - renormalize geometric weights over the remaining rollout
+
+def finite_time_gae_ratio(
+    horizon: Tensor,                          # (* n) remaining steps in segment
+    lam: float | Tensor                       # () or (b)
+) -> Tensor:
+    # (1 - lam ** (h - 1)) / (1 - lam ** h), stable near lam = 1
+    # gates already carry gamma * lam, so only the ratio is returned
+
+    lam = as_tensor(lam, device = horizon.device, dtype = horizon.dtype)
+
+    log_lam = lam.clamp(min = torch.finfo(lam.dtype).tiny).log()
+    log_lam = torch.where(lam < 1., log_lam, torch.where(lam > 1., -log_lam, -torch.ones_like(lam)))
+
+    ratio = torch.expm1((horizon - 1.) * log_lam) / torch.expm1(horizon * log_lam)
+    ratio = ratio / lam.clamp(min = 1.)
+
+    return torch.where(lam == 1., (horizon - 1.) / horizon, ratio)
+
 # generalized advantage estimation - Schulman et al.
 
 def calc_gae(
@@ -192,7 +211,8 @@ def calc_gae(
     return_advantages: bool = False,
     terminated: Tensor | None = None,         # (b n) gymnasium termination - no bootstrap, cut gae
     truncated: Tensor | None = None,          # (b n) gymnasium truncation - bootstrap, cut gae
-    chunk_size: int | tuple[int, ...] | list[int] = 1
+    chunk_size: int | tuple[int, ...] | list[int] = 1,
+    finite_time: bool = False                 # normalize geometric weights over the remaining rollout
 ) -> Tensor | GAE | tuple[Tensor | GAE, ...]:
     if isinstance(chunk_size, (tuple, list)):
         return tuple(
@@ -214,7 +234,8 @@ def calc_gae(
                 return_advantages = return_advantages,
                 terminated = terminated,
                 truncated = truncated,
-                chunk_size = k
+                chunk_size = k,
+                finite_time = finite_time
             )
             for k in chunk_size
         )
@@ -349,6 +370,7 @@ def calc_gae(
 
     if chunk_size > 1:
         trim = num_chunks * chunk_size
+        done_mask_steps = as_tensor(done_masks, device = device, dtype = dtype).expand_as(delta)
         step_discounts = as_tensor(gamma * done_masks, device = device, dtype = dtype).expand_as(delta)
 
         delta_chunks, step_discounts = tuple(
@@ -360,6 +382,9 @@ def calc_gae(
         gates = as_tensor(lam * step_discounts.prod(dim = -1), device = device, dtype = dtype).expand_as(delta)
         values = values[..., 0:trim:chunk_size]
 
+        if finite_time:
+            continuation = rearrange(done_mask_steps[..., :trim], '... (c k) -> ... c k', k = chunk_size).prod(dim = -1)
+
         if is_tensor(done_masks):
             done_masks = rearrange(done_masks[..., :trim], '... (c k) -> ... c k', k = chunk_size).prod(dim = -1)
 
@@ -367,6 +392,15 @@ def calc_gae(
             len_mask = len_mask[..., 0:trim:chunk_size]
     else:
         gates = as_tensor(gamma * lam * done_masks, device = device, dtype = dtype).expand_as(delta)
+
+        if finite_time:
+            continuation = as_tensor(done_masks, device = device, dtype = dtype).expand_as(delta)
+
+    # finite-time gae: count remaining steps per segment, then renormalize the geometric tail
+
+    if finite_time:
+        horizon = reverse_assoc_scan(continuation, torch.ones_like(delta), use_accelerated)
+        gates = gates * finite_time_gae_ratio(horizon, lam)
 
     # scan
 

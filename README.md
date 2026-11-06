@@ -139,6 +139,8 @@ For gymnasium environments, pass `terminated` and `truncated` directly and let `
 gae = calc_gae(rewards, values, terminated = terminated, truncated = truncated, return_advantages = True)
 ```
 
+The `finite_time` option follows *Finite-Time Generalized Advantage Estimation*.
+
 ### multi-critic
 
 One value network per reward group, each group's advantages normalized separately before combination - Mysore et al., Vijayan et al.
