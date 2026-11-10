@@ -308,16 +308,17 @@ class HierarchyLevel(Module):
         self.has_state_history = not is_bottom and use_state_history
 
         if self.has_state_history:
-            chunk_dim = state_history_len * state_dim
-            self.state_chunk_mlp = nn.Sequential(
-                Rearrange('... k d -> ... (k d)'),
-                nn.RMSNorm(chunk_dim),
-                nn.Linear(chunk_dim, dim // 4),
-                nn.SiLU(),
-                nn.Linear(dim // 4, dim)
-            )
-            nn.init.zeros_(self.state_chunk_mlp[-1].weight)
-            nn.init.zeros_(self.state_chunk_mlp[-1].bias)
+            with torch.random.fork_rng():
+                chunk_dim = state_history_len * state_dim
+                self.state_chunk_mlp = nn.Sequential(
+                    Rearrange('... k d -> ... (k d)'),
+                    nn.RMSNorm(chunk_dim),
+                    nn.Linear(chunk_dim, dim // 4),
+                    nn.SiLU(),
+                    nn.Linear(dim // 4, dim)
+                )
+                nn.init.zeros_(self.state_chunk_mlp[-1].weight)
+                nn.init.zeros_(self.state_chunk_mlp[-1].bias)
 
     def encode_stem(self, state):
         return self.stem(self.proj_in(state))
@@ -336,10 +337,19 @@ class HierarchyLevel(Module):
         return self.beta.log_prob(out, actions) if self.continuous else Categorical(logits = out).log_prob(actions)
 
     def action_entropy(self, out):
-        return self.beta.entropy(out) if self.continuous else Categorical(logits = out).entropy()
+        return self.beta.entropy(out).sum(dim = -1) if self.continuous else Categorical(logits = out).entropy()
 
     def action_mean(self, out):
         return self.beta.mean(out) if self.continuous else out.argmax(dim = -1)
+
+    def straight_through_actions(self, out, actions):
+        if self.continuous:
+            means = self.beta.mean(out)
+            return actions + means - means.detach()
+
+        probs = out.softmax(dim = -1)
+        one_hot = F.one_hot(actions.long(), probs.shape[-1]).float()
+        return one_hot + probs - probs.detach()
 
     def forward(
         self,
@@ -478,6 +488,7 @@ class HierarchicalActor(Module):
         state,
         level_index = 0,
         time_indices = None,
+        past_states = None,
         temperature = 0.5,
         bind_receiver = False
     ):
@@ -490,7 +501,10 @@ class HierarchicalActor(Module):
         receiver = self.levels[level_index]
         sender = self.levels[level_index + 1]
 
-        hidden = receiver.encode_stem(state).detach()
+        with torch.no_grad():
+            hidden = receiver.encode_stem(state)
+            if receiver.has_state_history and exists(past_states):
+                hidden = hidden + 0.02 * receiver.state_chunk_mlp(past_states)
 
         repeated_hidden = repeat(hidden, 'b d -> (b k) d', k = num_codes)
         repeated_time_indices = repeat(time_indices, 'b -> (b k)', k = num_codes) if exists(time_indices) else None
@@ -519,6 +533,53 @@ class HierarchicalActor(Module):
         delta_logits = steered_out - repeat(base_out, 'b a -> (b k) a', k = num_codes)
         probs = (delta_logits / temperature).softmax(dim = -1)
         return None, None, rearrange(probs, '(b k) a -> b k a', k = num_codes)
+
+    def counterfactual_base_action_chunks(
+        self,
+        state_chunks: Tensor,
+        level_index: int
+    ) -> tuple[Tensor, Tensor]:
+        assert 1 <= level_index < self.num_levels
+        batch_chunks, chunk_len, _ = state_chunks.shape
+        num_codes = self.num_internal_actions
+        dev = state_chunks.device
+
+        sender = self.levels[level_index]
+        target_codes = repeat(torch.arange(num_codes, device = dev), 'k -> (b k)', b = batch_chunks)
+        curr_latents = repeat(sender.readout.prototypes, 'k d -> (b k) 1 d', b = batch_chunks)
+        rep_states = repeat(state_chunks, 'b s d -> (b k) s d', k = num_codes)
+
+        for curr_level in reversed(range(level_index)):
+            level_mod = self.levels[curr_level]
+            stride_curr = self.hierarchies[curr_level]
+            stride_higher = self.hierarchies[curr_level + 1]
+            sub_steps = max(1, stride_higher // stride_curr)
+
+            sub_states = rep_states[:, 0::stride_curr]
+            num_sub = sub_states.shape[1]
+            latents_expanded = repeat(curr_latents, 'bk c d -> bk (c r) d', r = sub_steps)[:, :num_sub]
+            t_idx = torch.arange(num_sub, device = dev) % sub_steps
+            t_idx_flat = repeat(t_idx, 's -> (bk s)', bk = sub_states.shape[0])
+
+            flat_sub_states = rearrange(sub_states, 'bk s d -> (bk s) d')
+            flat_latents = rearrange(latents_expanded, 'bk s d -> (bk s) d')
+
+            hidden = level_mod.encode_stem(flat_sub_states)
+            hidden = level_mod.steered_norm(hidden + level_mod.from_higher(hidden, flat_latents, time_indices = t_idx_flat))
+            upper_hidden = level_mod.upper(hidden)
+            logits = level_mod.to_logits(upper_hidden)
+
+            if curr_level == 0:
+                action_repr = level_mod.beta.mean(logits) if self.continuous else logits.softmax(dim = -1)
+                action_chunks = rearrange(action_repr, '(bk s) a -> bk s a', bk = sub_states.shape[0], s = chunk_len)
+                return action_chunks, target_codes
+
+            probs = (logits / level_mod.readout.temperature).softmax(dim = -1)
+            soft_latent = einsum(probs, level_mod.readout.prototypes, 'n k, k d -> n d')
+            soft_latent = soft_latent + level_mod.residual_proj(upper_hidden)
+            curr_latents = rearrange(soft_latent, '(bk s) d -> bk s d', bk = sub_states.shape[0], s = num_sub)
+
+        raise RuntimeError('unreachable')
 
     def forward_level(
         self,
@@ -594,6 +655,78 @@ class Critic(Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+# underpowered DIAYN action-chunk discriminator with shrink-and-perturb
+
+class ActionChunkDiscriminator(Module):
+    def __init__(
+        self,
+        chunk_len: int,
+        num_actions: int,
+        num_codes: int,
+        hidden_dim: int = 16
+    ):
+        super().__init__()
+        self.chunk_len = chunk_len
+        self.num_actions = num_actions
+        self.num_codes = num_codes
+        self.log_num_codes = float(np.log(num_codes))
+
+        in_dim = (chunk_len + 1) * num_actions
+        self.net = nn.Sequential(
+            nn.RMSNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.RMSNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_codes, bias = False)
+        )
+
+    def forward(self, action_chunks: Tensor) -> Tensor:
+        flat_chunks = rearrange(action_chunks, 'b s a -> b (s a)')
+        mean_actions = action_chunks.mean(dim = 1)
+        logits = self.net(cat((flat_chunks, mean_actions), dim = -1))
+        return logits - logits.mean(dim = -1, keepdim = True)
+
+    @torch.no_grad()
+    def shrink_and_perturb_(self, shrink: float = 0.85, perturb: float = 0.02):
+        with torch.random.fork_rng():
+            for param in self.parameters():
+                noise = torch.randn_like(param)
+                if param.ndim >= 2:
+                    nn.init.orthogonal_(noise, gain = 1.)
+                param.mul_(shrink).add_(noise, alpha = perturb)
+
+    @torch.no_grad()
+    def intrinsic_reward(self, action_chunks: Tensor, codes: Tensor) -> Tensor:
+        log_probs = F.log_softmax(self(action_chunks), dim = -1)
+        chosen_log_q = log_probs.gather(-1, codes[:, None]).squeeze(-1)
+        return ((chosen_log_q + self.log_num_codes) / self.log_num_codes).clamp(-1., 1.)
+
+    def update_(
+        self,
+        optimizer: torch.optim.Optimizer,
+        real_chunks: Tensor,
+        real_codes: Tensor,
+        cf_chunks: Tensor,
+        cf_codes: Tensor,
+        *,
+        steps: int = 4,
+        shrink: float = 0.85,
+        perturb: float = 0.02
+    ):
+        self.shrink_and_perturb_(shrink = shrink, perturb = perturb)
+
+        counts = torch.bincount(real_codes, minlength = self.num_codes).float().clamp_min(1.)
+        class_weights = (counts.sum() / (self.num_codes * counts)).clamp(0.25, 4.)
+
+        for _ in range(steps):
+            loss = (
+                0.5 * F.cross_entropy(self(real_chunks), real_codes, weight = class_weights) +
+                0.5 * F.cross_entropy(self(cf_chunks), cf_codes)
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
 # evaluation and video recording
 
@@ -720,6 +853,279 @@ def plot_return_comparison(
     print(f'[plot] saved -> {out_path}')
     return str(out_path)
 
+# latent-action differentiation evaluation and visualization
+
+@torch.no_grad()
+def evaluate_latent_action_differentiation(
+    actor: HierarchicalActor,
+    env_name: str = 'LunarLander-v3',
+    continuous: bool = False,
+    num_eval_episodes: int = 16,
+    max_timesteps: int = 600,
+    seed: int = 200,
+    label: str = 'hierarchical'
+) -> dict:
+    actor.eval()
+    env = gym.make(env_name, max_episode_steps = max_timesteps, continuous = continuous)
+
+    num_levels, num_codes, num_actions = actor.num_levels, actor.num_internal_actions, actor.num_actions
+    log_k = float(np.log(num_codes))
+
+    level_chunks = {l: [] for l in range(1, num_levels)}
+    level_codes = {l: [] for l in range(1, num_levels)}
+    step_codes = {l: [] for l in range(1, num_levels)}
+    step_actions, episode_returns = [], []
+    sample_trajectory = None
+
+    for episode_index in range(num_eval_episodes):
+        obs, _ = env.reset(seed = seed + episode_index)
+        state = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+
+        held_latents = [zeros(1, actor.dim_latent, device = device) for _ in range(num_levels)]
+        held_codes = [0] * num_levels
+        past_states_buf = actor.init_past_states(1, device)
+
+        ep_actions, ep_states = [], []
+        ep_codes = {l: [] for l in range(1, num_levels)}
+        ep_return = 0.
+
+        for timestep in range(max_timesteps):
+            timestep_tensor = full((1,), timestep, dtype = torch.long, device = device)
+
+            for level_index in reversed(range(1, num_levels)):
+                stride, shift = actor.hierarchies[level_index], actor.phase_shifts[level_index]
+                if timestep == 0 or divisible_by(timestep - shift, stride):
+                    time_indices = actor.level_time_indices(level_index, timestep_tensor)
+                    latent_above = held_latents[level_index + 1] if (level_index + 1) < num_levels else None
+                    latent, sampled_code, _, _ = actor.forward_level(
+                        level_index, state, latent_from_higher = latent_above,
+                        time_indices = time_indices, past_states = past_states_buf[level_index]
+                    )
+                    held_latents[level_index] = latent
+                    held_codes[level_index] = int(sampled_code.item())
+
+            action_out = actor.forward_level(
+                0, state, latent_from_higher = held_latents[1] if num_levels > 1 else None,
+                time_indices = actor.level_time_indices(0, timestep_tensor)
+            )
+            actor.update_past_states(past_states_buf, state, timestep)
+
+            action = actor.levels[0].action_mean(action_out)
+            act_np = action.squeeze(0).cpu().numpy() if continuous else int(action.item())
+            act_vec = act_np.astype(np.float32) if continuous else np.eye(num_actions, dtype = np.float32)[act_np]
+
+            ep_states.append(obs.copy())
+            ep_actions.append(act_vec)
+            step_actions.append(act_np)
+
+            for level_index in range(1, num_levels):
+                ep_codes[level_index].append(held_codes[level_index])
+                step_codes[level_index].append(held_codes[level_index])
+
+            obs, reward, terminated, truncated, _ = env.step(act_np)
+            ep_return += float(reward)
+
+            if terminated or truncated:
+                break
+
+            state = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+
+        episode_returns.append(ep_return)
+
+        if not exists(sample_trajectory) or ep_return > sample_trajectory['return']:
+            sample_trajectory = dict(
+                states = np.asarray(ep_states),
+                actions = np.asarray(ep_actions),
+                codes = {l: np.asarray(ep_codes[l]) for l in range(1, num_levels)},
+                return_ = ep_return
+            )
+            sample_trajectory['return'] = ep_return
+
+        ep_actions_arr = np.asarray(ep_actions, dtype = np.float32)
+        for level_index in range(1, num_levels):
+            stride = actor.hierarchies[level_index]
+            for start_t in range(0, (len(ep_actions_arr) // stride) * stride, stride):
+                level_chunks[level_index].append(ep_actions_arr[start_t:start_t + stride])
+                level_codes[level_index].append(ep_codes[level_index][start_t])
+
+    env.close()
+
+    results = dict(label = label, mean_eval_return = float(np.mean(episode_returns)), levels = {}, sample_trajectory = sample_trajectory)
+    step_actions_arr = np.asarray(step_actions)
+
+    print(f'\n=== Latent-Action Differentiation Report: {label} (Eval Return: {results["mean_eval_return"]:+.1f}) ===')
+
+    for level_index in range(1, num_levels):
+        stride = actor.hierarchies[level_index]
+        chunks_np = np.asarray(level_chunks[level_index], dtype = np.float32)
+        codes_np = np.asarray(level_codes[level_index], dtype = np.int64)
+        step_codes_np = np.asarray(step_codes[level_index], dtype = np.int64)
+
+        code_counts = np.bincount(codes_np, minlength = num_codes).astype(np.float64)
+        code_usage = code_counts / max(1., code_counts.sum())
+        usage_entropy = -np.sum(code_usage * np.log(np.clip(code_usage, 1e-12, 1.))) / log_k
+
+        cond_action_dist = np.full((num_codes, num_actions), 1. / num_actions, dtype = np.float64)
+        for k in range(num_codes):
+            mask = (step_codes_np == k)
+            if not mask.any():
+                continue
+            if continuous:
+                cond_action_dist[k] = chunks_np[codes_np == k].mean(axis = (0, 1)) if (codes_np == k).any() else 0.
+            else:
+                counts_k = np.bincount(step_actions_arr[mask], minlength = num_actions).astype(np.float64)
+                cond_action_dist[k] = counts_k / max(1., counts_k.sum())
+
+        norm_mi_logk, norm_mi_ha = 0., 0.
+        if not continuous:
+            joint = np.zeros((num_codes, num_actions), dtype = np.float64)
+            np.add.at(joint, (step_codes_np, step_actions_arr), 1.)
+            joint /= max(1., joint.sum())
+            p_z, p_a = joint.sum(axis = 1, keepdims = True), joint.sum(axis = 0, keepdims = True)
+            mi_za = float(np.sum(joint * np.log(np.clip(joint, 1e-12, 1.) / np.clip(p_z @ p_a, 1e-12, 1.))))
+            h_a = float(-np.sum(p_a * np.log(np.clip(p_a, 1e-12, 1.))))
+            norm_mi_logk, norm_mi_ha = mi_za / log_k, mi_za / max(1e-8, h_a)
+
+        active_codes = [k for k in range(num_codes) if code_usage[k] > 0.02]
+        tv_dists = [
+            0.5 * float(np.abs(cond_action_dist[i] - cond_action_dist[j]).sum())
+            if (code_usage[i] > 0.01 and code_usage[j] > 0.01) else 0.
+            for i in range(num_codes) for j in range(i + 1, num_codes)
+        ]
+        mean_tv = float(np.mean(tv_dists)) if tv_dists else 0.
+
+        with torch.enable_grad(), torch.random.fork_rng():
+            torch.manual_seed(0)
+            chunks_t = torch.from_numpy(chunks_np).float().to(device)
+            codes_t = torch.from_numpy(codes_np).long().to(device)
+            perm = torch.randperm(len(codes_t), device = device)
+            preds_all = torch.zeros_like(codes_t)
+
+            for fold in range(2):
+                val_idx, train_idx = perm[fold::2], perm[(1 - fold)::2]
+                probe = ActionChunkDiscriminator(stride, num_actions, num_codes, hidden_dim = 16).to(device)
+                probe_opt = torch.optim.AdamW(probe.parameters(), lr = 1e-2, weight_decay = 1e-3)
+                counts_tr = torch.bincount(codes_t[train_idx], minlength = num_codes).float().clamp_min(1.)
+                weights = (counts_tr.sum() / (num_codes * counts_tr)).clamp(0.2, 5.)
+
+                for _ in range(80):
+                    loss_p = F.cross_entropy(probe(chunks_t[train_idx]), codes_t[train_idx], weight = weights)
+                    probe_opt.zero_grad()
+                    loss_p.backward()
+                    probe_opt.step()
+
+                with torch.no_grad():
+                    preds_all[val_idx] = probe(chunks_t[val_idx]).argmax(dim = -1)
+
+            preds_np = preds_all.cpu().numpy()
+
+        raw_acc = float(np.mean(preds_np == codes_np))
+        balanced_acc = float(np.mean([
+            float(np.mean(preds_np[codes_np == k] == k)) if (codes_np == k).sum() >= 3 else 0.
+            for k in range(num_codes)
+        ]))
+
+        conf_mat = np.zeros((num_codes, num_codes), dtype = np.float64)
+        np.add.at(conf_mat, (codes_np, preds_np), 1.)
+        conf_mat /= max(1., conf_mat.sum())
+        pz_t, pz_p = conf_mat.sum(axis = 1, keepdims = True), conf_mat.sum(axis = 0, keepdims = True)
+        chunk_mi = float(np.sum(conf_mat * np.log(np.clip(conf_mat, 1e-12, 1.) / np.clip(pz_t @ pz_p, 1e-12, 1.)))) / log_k
+
+        results['levels'][level_index] = dict(
+            stride = stride, code_usage = code_usage, usage_entropy = float(usage_entropy),
+            cond_action_dist = cond_action_dist, norm_mi_logk = norm_mi_logk, norm_mi_ha = norm_mi_ha,
+            mean_tv = mean_tv, chunk_raw_acc = raw_acc, chunk_balanced_acc = balanced_acc,
+            chunk_mi = chunk_mi, num_active_codes = len(active_codes)
+        )
+
+        print(
+            f'  Level {level_index} (dt={stride}): '
+            f'active_codes={len(active_codes)}/{num_codes} | usage_H={100. * usage_entropy:5.1f}% | '
+            f'chunk_balanced_acc={100. * balanced_acc:5.1f}% (chance=25.0%) | '
+            f'chunk_MI={100. * chunk_mi:5.1f}% | step_MI/H(A)={100. * norm_mi_ha:5.1f}% | '
+            f'pairwise_TV={100. * mean_tv:5.1f}%'
+        )
+        action_names = ('No-op', 'Left', 'Main', 'Right') if (not continuous and num_actions == 4) else tuple(f'a{i}' for i in range(num_actions))
+        for k in range(num_codes):
+            probs_str = ', '.join(f'{action_names[a]}={100. * cond_action_dist[k, a]:4.1f}%' for a in range(num_actions))
+            print(f'    z={k} (used {100. * code_usage[k]:4.1f}%): [{probs_str}]')
+
+    return results
+
+def plot_diayn_differentiation_comparison(
+    base_eval: dict,
+    diayn_eval: dict,
+    out_path: str | Path = './lunar-recording/diayn_action_differentiation.png'
+):
+    sns.set_theme(style = 'whitegrid', context = 'notebook')
+    fig, axes = plt.subplots(2, 3, figsize = (16., 9.5), dpi = 160)
+
+    action_names = ['No-op', 'Left', 'Main', 'Right']
+    levels = sorted(base_eval['levels'].keys())[:2]
+
+    for row_idx, level_index in enumerate(levels):
+        stride = base_eval['levels'][level_index]['stride']
+        for col_idx, (eval_dict, title_tag) in enumerate(((base_eval, 'Baseline Hierarchy (no DIAYN)'), (diayn_eval, 'Hierarchy + DIAYN Discriminator'))):
+            ax = axes[row_idx, col_idx]
+            lvl = eval_dict['levels'][level_index]
+            mat, usage = lvl['cond_action_dist'] * 100., lvl['code_usage'] * 100.
+            y_labels = [f'z={k} ({usage[k]:.0f}%)' for k in range(mat.shape[0])]
+
+            sns.heatmap(
+                mat, annot = True, fmt = '.1f', cmap = 'YlGnBu', vmin = 0., vmax = 80.,
+                xticklabels = action_names, yticklabels = y_labels, cbar = False, ax = ax
+            )
+            ax.set_title(
+                f'{title_tag} — L{level_index} (dt={stride})\n'
+                f'Bal Acc: {100. * lvl["chunk_balanced_acc"]:.1f}% | TV: {100. * lvl["mean_tv"]:.1f}% | Usage H: {100. * lvl["usage_entropy"]:.1f}%',
+                fontsize = 10.5, fontweight = 'bold'
+            )
+            ax.set_xlabel('Base Primitive Action P(a | z) [%]')
+            ax.set_ylabel(f'Level {level_index} Latent Code z')
+
+    ax_bar = axes[0, 2]
+    metrics = [
+        (f'L{l} {tag}', base_eval['levels'][l][key], diayn_eval['levels'][l][key])
+        for l in levels
+        for tag, key in (('Chunk\nBal Acc', 'chunk_balanced_acc'), ('Action\nTV Diff', 'mean_tv'), ('Code\nUsage H', 'usage_entropy'))
+    ]
+    x_pos, width = np.arange(len(metrics)), 0.36
+    ax_bar.bar(x_pos - width / 2, [100. * m[1] for m in metrics], width, label = 'Baseline (no DIAYN)', color = '#4c72b0')
+    ax_bar.bar(x_pos + width / 2, [100. * m[2] for m in metrics], width, label = '+ DIAYN (Shrink & Perturb)', color = '#dd8452')
+    ax_bar.axhline(25., color = 'gray', linestyle = '--', linewidth = 1., label = '4-Code Chance (25%)')
+    ax_bar.set_xticks(x_pos)
+    ax_bar.set_xticklabels([m[0] for m in metrics], fontsize = 9)
+    ax_bar.set_ylim(0., 105.)
+    ax_bar.set_ylabel('Percentage (%)')
+    ax_bar.set_title('Latent-to-Base-Action Explainability & Diversity', fontsize = 10.5, fontweight = 'bold')
+    ax_bar.legend(loc = 'upper right', fontsize = 8.5)
+
+    ax_traj = axes[1, 2]
+    traj = diayn_eval['sample_trajectory']
+    if exists(traj) and len(traj['states']) > 0:
+        t_steps = np.arange(len(traj['states']))
+        prim_actions = traj['actions'].argmax(axis = -1)
+        codes_l1 = traj['codes'][1]
+        palette = ('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728')
+        for k in range(4):
+            mask = (codes_l1 == k)
+            if mask.any():
+                ax_traj.scatter(t_steps[mask], prim_actions[mask] + (k - 1.5) * 0.05, s = 18, color = palette[k], label = f'z1={k}', alpha = 0.85)
+        ax_traj.set_yticks([0, 1, 2, 3])
+        ax_traj.set_yticklabels(action_names)
+        ax_traj.set_xlabel('Episode Timestep t')
+        ax_traj.set_ylabel('Executed Base Action a_t')
+        ax_traj.set_title(f'DIAYN Eval Rollout: Action vs Active Latent z1 (Return {traj["return"]:+.1f})', fontsize = 10.5, fontweight = 'bold')
+        ax_traj.legend(loc = 'upper right', ncol = 2, fontsize = 8.5)
+
+    plt.tight_layout()
+    out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents = True, exist_ok = True)
+    fig.savefig(out_path, bbox_inches = 'tight')
+    plt.close(fig)
+    print(f'[plot] saved differentiation comparison -> {out_path}')
+    return str(out_path)
+
 # main
 
 def main(
@@ -734,8 +1140,16 @@ def main(
     updates_per_phase = 10,
     simultaneous = False,
     use_state_history = True,
-    always_train_base_level = True,
+    always_train_base_level = False,
     reset_latents_on_done = True,
+    use_diayn = False,
+    diayn_disc_hidden_dim = 16,
+    diayn_disc_lr = 3.0e-3,
+    diayn_disc_steps = 4,
+    diayn_reward_weight = 0.08,
+    diayn_loss_weight = 0.12,
+    diayn_shrink = 0.85,
+    diayn_perturb = 0.02,
     num_envs = 16,
     rollout_steps = 384,
     max_episode_steps = 600,
@@ -762,12 +1176,72 @@ def main(
     save_path = './ppo_hierarchical.pt',
     log_csv = None,
     compare_with_flat = False,
-    comparison_plot_path = './lunar-recording/lunar_returns_comparison.png'
+    compare_diayn = False,
+    return_actor = False,
+    comparison_plot_path = './lunar-recording/lunar_returns_comparison.png',
+    diayn_plot_path = './lunar-recording/diayn_action_differentiation.png'
 ):
     hierarchies = resolve_hierarchies(hierarchies)
     num_levels = len(hierarchies)
     total_phases = default(num_phases, num_cycles * num_levels)
     cycle_length = default(cycle_length, num_levels)
+
+    if compare_diayn:
+        out_dir = Path(video_folder)
+        base_csv = out_dir / 'hier_baseline_returns.csv'
+        diayn_csv = out_dir / 'hier_diayn_returns.csv'
+        base_ckpt = out_dir / 'ppo_hier_baseline.pt'
+        diayn_ckpt = out_dir / 'ppo_hier_diayn.pt'
+
+        common = dict(
+            env_name = env_name, continuous = continuous, beta_init_conc = beta_init_conc,
+            hierarchies = hierarchies, phase_shifts = phase_shifts,
+            num_phases = total_phases, cycle_length = cycle_length, updates_per_phase = updates_per_phase,
+            simultaneous = simultaneous, use_state_history = use_state_history,
+            always_train_base_level = always_train_base_level, reset_latents_on_done = reset_latents_on_done,
+            num_envs = num_envs, rollout_steps = rollout_steps, max_episode_steps = max_episode_steps,
+            actor_hidden_dim = actor_hidden_dim, critic_hidden_dim = critic_hidden_dim,
+            num_internal_actions = num_internal_actions, dim_latent = dim_latent, low_rank = low_rank,
+            epochs = epochs, minibatch_envs = minibatch_envs, lr = lr, critic_lr = critic_lr,
+            gamma = gamma, lam = lam, eps_clip = eps_clip,
+            internal_policy_loss_weight = internal_policy_loss_weight,
+            binding_loss_weight = binding_loss_weight, coupling_loss_weight = coupling_loss_weight,
+            diayn_disc_hidden_dim = diayn_disc_hidden_dim, diayn_disc_lr = diayn_disc_lr,
+            diayn_disc_steps = diayn_disc_steps, diayn_reward_weight = diayn_reward_weight,
+            diayn_loss_weight = diayn_loss_weight, diayn_shrink = diayn_shrink, diayn_perturb = diayn_perturb,
+            max_grad_norm = max_grad_norm, seed = seed, video_folder = video_folder, return_actor = True
+        )
+
+        print(f'=== [1/2] Baseline Hierarchical {hierarchies} (use_diayn=False) ===', flush = True)
+        base_actor = main(
+            **common, use_diayn = False, render = False,
+            save_path = str(base_ckpt), log_csv = str(base_csv)
+        )
+        base_eval = evaluate_latent_action_differentiation(
+            base_actor, env_name = env_name, continuous = continuous,
+            max_timesteps = max_episode_steps, label = 'Baseline Hierarchy (no DIAYN)'
+        )
+
+        print(f'\n=== [2/2] DIAYN Hierarchical {hierarchies} (use_diayn=True, shrink={diayn_shrink}, perturb={diayn_perturb}) ===', flush = True)
+        diayn_actor = main(
+            **common, use_diayn = True, render = render, video_prefix = 'hierarchical-diayn-best',
+            save_path = str(diayn_ckpt), log_csv = str(diayn_csv)
+        )
+        diayn_eval = evaluate_latent_action_differentiation(
+            diayn_actor, env_name = env_name, continuous = continuous,
+            max_timesteps = max_episode_steps, label = 'Hierarchy + DIAYN Discriminator'
+        )
+
+        plot_return_comparison(
+            [base_csv, diayn_csv],
+            [f'hierarchical {hierarchies} (no DIAYN)', f'hierarchical {hierarchies} + DIAYN'],
+            out_path = out_dir / 'diayn_returns_comparison.png',
+            title = f'{env_name}: Baseline Hierarchy vs DIAYN Action-Chunk Discriminator'
+        )
+        plot_diayn_differentiation_comparison(
+            base_eval, diayn_eval, out_path = diayn_plot_path
+        )
+        return
 
     if compare_with_flat:
         out_dir = Path(video_folder)
@@ -789,7 +1263,8 @@ def main(
             (f'hierarchical {hierarchies} dim={actor_hidden_dim}', dict(
                 hierarchies = hierarchies, phase_shifts = phase_shifts, simultaneous = simultaneous,
                 use_state_history = use_state_history, always_train_base_level = always_train_base_level,
-                reset_latents_on_done = reset_latents_on_done, actor_hidden_dim = actor_hidden_dim,
+                reset_latents_on_done = reset_latents_on_done, use_diayn = use_diayn,
+                actor_hidden_dim = actor_hidden_dim,
                 num_internal_actions = num_internal_actions, dim_latent = dim_latent, low_rank = low_rank,
                 internal_policy_loss_weight = internal_policy_loss_weight, binding_loss_weight = binding_loss_weight,
                 coupling_loss_weight = coupling_loss_weight, render = render, video_prefix = video_prefix,
@@ -880,6 +1355,20 @@ def main(
     opt_all = torch.optim.AdamW(actor.parameters(), lr = lr)
     opt_critic = torch.optim.AdamW(critic.parameters(), lr = critic_lr)
 
+    discriminators = {}
+    disc_optimizers = {}
+    if use_diayn and num_levels > 1:
+        with torch.random.fork_rng():
+            for level_index in range(1, num_levels):
+                disc = ActionChunkDiscriminator(
+                    chunk_len = hierarchies[level_index],
+                    num_actions = num_actions,
+                    num_codes = num_internal_actions,
+                    hidden_dim = diayn_disc_hidden_dim
+                ).to(device)
+                discriminators[level_index] = disc
+                disc_optimizers[level_index] = torch.optim.AdamW(disc.parameters(), lr = diayn_disc_lr, weight_decay = 1e-3)
+
     phases = [('all', updates_per_phase) for _ in range(total_phases)] if simultaneous else [
         (phase_index % num_levels, updates_per_phase) for phase_index in range(total_phases)
     ]
@@ -924,6 +1413,9 @@ def main(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = level_lrs[level_index] * lr_scale * co_scale * param_group.get('lr_mult', 1.)
 
+        for param_group in opt_all.param_groups:
+            param_group['lr'] = lr * lr_scale
+
         phase_returns = []
         landed_flags = []
         start_return_32 = float(np.mean(recent_returns[-32:])) if recent_returns else -200.
@@ -946,7 +1438,7 @@ def main(
                     for level_index in reversed(range(1, num_levels)):
                         stride = hierarchies[level_index]
                         shift = phase_shifts[level_index]
-                        if divisible_by(timestep - shift, stride):
+                        if timestep == 0 or divisible_by(timestep - shift, stride):
                             latent_above = held_latents[level_index + 1] if (level_index + 1) < num_levels else None
                             latent, sampled_code, _, probs = actor.forward_level(
                                 level_index, state, latent_from_higher = latent_above,
@@ -1044,6 +1536,41 @@ def main(
                     use_accelerated = False,
                     return_advantages = True
                 )
+                actor_gae_per_level = gae_per_level
+
+            if use_diayn and isinstance(phase, int) and 1 <= phase < num_levels:
+                active_level = phase
+                active_stride = hierarchies[active_level]
+                disc = discriminators[active_level]
+
+                with torch.no_grad():
+                    action_vecs = actions if continuous else F.one_hot(actions.long(), num_actions).float()
+                    rollout_action_chunks = rearrange(action_vecs, 'b (c s) a -> (b c) s a', s = active_stride)
+                    rollout_code_chunks = rearrange(internal_actions[active_level][:, 0::active_stride], 'b c -> (b c)')
+                    state_chunks_all = rearrange(states, 'b (c s) d -> (b c) s d', s = active_stride)
+                    cf_sub_chunks, cf_sub_codes = actor.counterfactual_base_action_chunks(state_chunks_all[:64], active_level)
+
+                disc.update_(
+                    disc_optimizers[active_level],
+                    rollout_action_chunks, rollout_code_chunks,
+                    cf_sub_chunks, cf_sub_codes,
+                    steps = diayn_disc_steps, shrink = diayn_shrink, perturb = diayn_perturb
+                )
+
+                with torch.no_grad():
+                    chunk_diayn_reward = rearrange(disc.intrinsic_reward(rollout_action_chunks, rollout_code_chunks), '(b c) -> b c', b = num_envs)
+                    step_diayn_reward = repeat(chunk_diayn_reward / active_stride, 'b c -> b (c s)', s = active_stride)
+                    actor_gae_per_level = calc_gae(
+                        rewards + diayn_reward_weight * step_diayn_reward,
+                        values,
+                        masks = done_masks,
+                        next_value = next_value,
+                        gamma = gamma,
+                        lam = lam,
+                        chunk_size = hierarchies,
+                        use_accelerated = False,
+                        return_advantages = True
+                    )
 
             for epoch_index in range(epochs):
                 perm = torch.randperm(num_envs, device = device)
@@ -1057,11 +1584,11 @@ def main(
                     batch_old_log_probs = old_action_log_probs[batch_indices]
                     batch_old_values = values[batch_indices]
                     batch_base_returns = gae_per_level[0].returns[batch_indices]
-                    batch_base_advantages = gae_per_level[0].advantages[batch_indices]
+                    batch_base_advantages = actor_gae_per_level[0].advantages[batch_indices]
 
                     flat_states = rearrange(batch_states, 'b t d -> (b t) d')
                     flat_actions = rearrange(batch_actions, 'b t ... -> (b t) ...')
-                    flat_old_log_probs = rearrange(batch_old_log_probs, 'b t -> (b t)')
+                    flat_old_log_probs = rearrange(batch_old_log_probs, 'b t ... -> (b t) ...')
                     flat_base_advantages = rearrange(batch_base_advantages, 'b t -> (b t)')
                     flat_base_returns = rearrange(batch_base_returns, 'b t -> (b t)')
                     flat_old_values = rearrange(batch_old_values, 'b t -> (b t)')
@@ -1126,6 +1653,13 @@ def main(
                                 binding_aux = continuous_binding_loss(cf_means, cf_stds) if continuous else counterfactual_decoder_binding_loss(cf_probs)
                                 loss = loss + 0.5 * binding_loss_weight * aux_scale * binding_aux
 
+                            if use_diayn:
+                                state_chunks_l1 = rearrange(batch_states, 'b (c s) d -> (b c) s d', s = hierarchies[1])[:24]
+                                with frozen((discriminators[1],)):
+                                    cf_chunks_l1, cf_codes_l1 = actor.counterfactual_base_action_chunks(state_chunks_l1, 1)
+                                    diayn_preserve = F.cross_entropy(discriminators[1](cf_chunks_l1), cf_codes_l1)
+                                loss = loss + 0.25 * diayn_loss_weight * diayn_preserve
+
                         level_optimizers[0].zero_grad()
                         loss.backward()
                         nn.utils.clip_grad_norm_(level_params[0], max_grad_norm)
@@ -1140,7 +1674,7 @@ def main(
                         chunk_internal_actions = chunk_actions_per_level[level_index]
                         chunk_old_log_probs = chunk_old_log_probs_per_level[level_index]
                         chunk_probs = probs_per_level[level_index]
-                        chunk_advantages = rearrange(gae_per_level[level_index].advantages[batch_indices], 'b c -> (b c)')
+                        chunk_advantages = rearrange(actor_gae_per_level[level_index].advantages[batch_indices], 'b c -> (b c)')
 
                         internal_dist = Categorical(probs = chunk_probs)
                         level_policy_loss = hpo_actor_loss(internal_dist.log_prob(chunk_internal_actions), chunk_old_log_probs, chunk_advantages, eps_clip = eps_clip, normalize_advantages = True).mean()
@@ -1151,10 +1685,16 @@ def main(
                         binding_states = chunk_states[:sub_count][active_slice]
 
                         lower_is_continuous = continuous and lower_index == 0
+                        lower_past_states = (
+                            rearrange(past_states_stacked[lower_index][batch_indices][:, 0::stride], 'b c k d -> (b c) k d')
+                            if (actor.use_state_history and lower_index >= 1) else None
+                        )
+                        binding_past_states = lower_past_states[:sub_count][active_slice] if exists(lower_past_states) else None
 
                         binding_means, binding_stds, binding_probs = actor.counterfactual_probe(
                             binding_states, level_index = lower_index,
                             time_indices = zeros(binding_states.shape[0], dtype = torch.long, device = device),
+                            past_states = binding_past_states,
                             bind_receiver = False
                         )
                         binding_loss = continuous_binding_loss(binding_means, binding_stds) if lower_is_continuous else counterfactual_decoder_binding_loss(binding_probs)
@@ -1163,6 +1703,7 @@ def main(
                             cf_means, cf_stds, cf_probs = actor.counterfactual_probe(
                                 chunk_states, level_index = lower_index,
                                 time_indices = zeros(chunk_states.shape[0], dtype = torch.long, device = device),
+                                past_states = lower_past_states,
                                 bind_receiver = False
                             )
 
@@ -1184,27 +1725,28 @@ def main(
                                 chunk_probs[positive_mask], cf_probs[positive_mask], target_actions[positive_mask]
                             )
 
-                        if lower_index == 0:
-                            lower_policy_loss = base_policy_loss
-                            lower_entropy = base_entropy
-                        else:
-                            lower_dist = Categorical(probs = probs_per_level[lower_index])
-                            lower_advantages = rearrange(gae_per_level[lower_index].advantages[batch_indices], 'b c -> (b c)')
-                            lower_policy_loss = 0.5 * base_policy_loss + 0.5 * hpo_actor_loss(
-                                lower_dist.log_prob(chunk_actions_per_level[lower_index]),
-                                chunk_old_log_probs_per_level[lower_index],
-                                lower_advantages,
-                                eps_clip = eps_clip,
-                                normalize_advantages = True
-                            ).mean()
-                            lower_entropy = lower_dist.entropy().mean()
+                        diayn_aux_loss = zeros((), device = device)
+                        if use_diayn:
+                            disc = discriminators[level_index]
+                            st_base_actions = base_level.straight_through_actions(level_out, flat_actions)
+                            st_action_chunks = rearrange(st_base_actions, '(b c s) a -> (b c) s a', b = batch_size, s = stride)
+                            state_chunks_mb = rearrange(batch_states, 'b (c s) d -> (b c) s d', s = stride)[:24]
+
+                            with frozen((disc,)):
+                                cf_action_chunks, cf_target_codes = actor.counterfactual_base_action_chunks(state_chunks_mb, level_index)
+                                diayn_real_ce = F.cross_entropy(disc(st_action_chunks), chunk_internal_actions)
+                                diayn_cf_ce = F.cross_entropy(disc(cf_action_chunks), cf_target_codes)
+
+                            marginal_entropy_loss = disc.log_num_codes - categorical_entropy(chunk_probs.mean(dim = 0))
+                            diayn_aux_loss = 0.5 * (diayn_real_ce + diayn_cf_ce + marginal_entropy_loss)
 
                         loss = (
-                            lower_policy_loss +
+                            base_policy_loss +
                             internal_policy_loss_weight * level_policy_loss -
-                            entropy_coef * (lower_entropy + internal_dist.entropy().mean()) +
+                            entropy_coef * (base_entropy + internal_dist.entropy().mean()) +
                             binding_loss_weight * aux_scale * binding_loss +
-                            coupling_loss_weight * aux_scale * coupling_loss
+                            coupling_loss_weight * aux_scale * coupling_loss +
+                            diayn_loss_weight * diayn_aux_loss
                         )
 
                         co_step_base = always_train_base_level and (epoch_index == epochs - 1)
@@ -1268,6 +1810,9 @@ def main(
             actor, env_name = env_name, continuous = continuous,
             video_folder = video_folder, video_prefix = video_prefix, max_timesteps = max_episode_steps
         )
+
+    if return_actor:
+        return actor
 
 if __name__ == '__main__':
     fire.Fire(main)
