@@ -2797,5 +2797,166 @@ def test_smdp_gae_shapes_and_edge_cases():
     with pytest.raises(ValueError):
         calc_gae(torch.randn(2, 8), torch.randn(2, 8), durations = torch.ones(2, 8), chunk_size = 2)
 
+# semi-markov next-latent q-critic & multi-horizon candidate action filtering tests
+
+def test_smdp_q_critic_discrete_horizons_and_gae_targets():
+    torch.manual_seed(0)
+
+    batch, seq, dim_embed = 3, 6, 8
+    horizons = tensor([1., 1., 2., 2., 4., 8.])
+    num_actions = horizons.numel()
+    gamma = 0.99
+
+    critic = NextLatentQCritic(
+        nn.Linear(dim_embed, 1),
+        dim_embed = dim_embed,
+        num_actions = num_actions,
+        action_embed_dim = 16,
+        action_horizons = horizons,
+        hidden_dim = 32,
+        depth = 2,
+        gamma = gamma
+    )
+
+    embeddings = torch.randn(batch, seq, dim_embed)
+    next_embeddings = torch.randn(batch, seq, dim_embed)
+    actions = torch.randint(0, num_actions, (batch, seq))
+    nom_durs = horizons[actions]
+    terminated = torch.rand(batch, seq) < 0.15
+    truncated = (~terminated) & (torch.rand(batch, seq) < 0.1)
+    durations = torch.where(terminated | truncated, torch.ones_like(nom_durs), nom_durs)
+    rewards = 0.2 * torch.randn(batch, seq)
+
+    with torch.no_grad():
+        values = critic.forward_value(embeddings)
+        next_values = critic.forward_value(next_embeddings)
+        gae = calc_smdp_gae(
+            rewards, values, durations,
+            next_values = next_values,
+            terminated = terminated,
+            truncated = truncated,
+            gamma = gamma,
+            lam = 0.95,
+            trace_power = 1.,
+            use_accelerated = False
+        )
+        q_gae = calc_smdp_gae(
+            rewards, values, durations,
+            next_values = next_values,
+            terminated = terminated,
+            truncated = truncated,
+            gamma = gamma,
+            lam = 0.8,
+            trace_power = 1.,
+            use_accelerated = False
+        )
+
+    loss, out = critic(
+        embeddings,
+        actions,
+        rewards = rewards,
+        next_embeddings = next_embeddings,
+        returns = gae.returns,
+        dones = terminated,
+        durations = durations,
+        q_targets = q_gae.returns,
+        return_loss_breakdown = True
+    )
+
+    assert torch.isfinite(loss)
+    assert out.duration is not None and torch.isfinite(out.duration)
+
+    pred_durs = critic.predicted_durations(embeddings, actions)
+    assert pred_durs.shape == (batch, seq)
+    assert ((pred_durs >= 1. - 1e-5) & (pred_durs <= nom_durs + 1e-5)).all()
+
+    loss.backward()
+    for module in (critic.value_net, critic.action_embed, critic.net, critic.to_duration):
+        assert any(p.grad is not None for p in module.parameters())
+
+    # q_lam = 0 in calc_smdp_gae matches the 1-option SMDP Bellman backup inside NextLatentQCritic
+
+    q_gae_td0 = calc_smdp_gae(
+        rewards, values, durations,
+        next_values = next_values,
+        terminated = terminated,
+        truncated = truncated,
+        gamma = gamma,
+        lam = 0.,
+        use_accelerated = False
+    )
+    _, out_bellman = critic(
+        embeddings, actions,
+        rewards = rewards,
+        next_values = next_values,
+        dones = terminated,
+        durations = durations,
+        return_loss_breakdown = True
+    )
+    _, out_q0 = critic(
+        embeddings, actions,
+        rewards = rewards,
+        dones = terminated,
+        durations = durations,
+        q_targets = q_gae_td0.returns,
+        return_loss_breakdown = True
+    )
+    assert torch.allclose(out_bellman.q, out_q0.q, atol = 1e-6)
+
+def test_smdp_rate_advantage_resolves_multi_horizon_paradox():
+    # option 0: tau = 1, Q = +1.0 -> infinite-horizon return 1 / (1 - 0.99) = 100.0
+    # option 1: tau = 8, Q = +4.0 -> infinite-horizon return 4 / (1 - 0.99^8) = 51.8
+    # option 2: tau = 1, Q = -0.8 (mild 1-step loss)
+    # option 3: tau = 8, Q = -3.86 (8-step lock-in loss, even though -3.86 / 7.7255 = -0.50 > -0.80)
+
+    gamma = 0.99
+    critic = NextLatentQCritic(
+        nn.Linear(2, 1, bias = False),
+        dim_embed = 2,
+        num_actions = 4,
+        action_embed_dim = 4,
+        action_horizons = (1, 8, 1, 8),
+        hidden_dim = 8,
+        depth = 1,
+        gamma = gamma
+    )
+
+    # mock _heads Q-values via action-dependent linear readout
+
+    with torch.no_grad():
+        critic.value_net.weight.zero_()
+        critic.action_embed.weight.copy_(torch.eye(4))
+        critic.net = nn.Identity()
+        critic.to_next_latent_and_q = nn.Linear(6, 3, bias = False)
+        critic.to_next_latent_and_q.weight.zero_()
+        critic.to_next_latent_and_q.weight[2, 2:] = tensor([1., 4., -0.8, -3.86])
+        critic.to_reward = nn.Linear(6, 1, bias = False)
+        critic.to_done = nn.Linear(6, 1, bias = False)
+        critic.to_duration = nn.Linear(6, 1)
+        critic.to_duration.weight.zero_()
+        critic.to_duration.bias.fill_(50.)
+
+    z = torch.zeros(1, 2)
+
+    # positive advantage pair: raw Q-max picks option 1 (4.0 > 1.0), rate_advantage picks option 0 (1.0 > 4.0 / 7.7255 = 0.518)
+
+    pos_cands = tensor([[0, 1]])
+    naive_pos = critic.filter_actions(z, pos_cands, rate_advantage = False)
+    smdp_pos = critic.filter_actions(z, pos_cands, rate_advantage = True)
+    assert naive_pos.actions.item() == 1
+    assert smdp_pos.actions.item() == 0
+
+    adv_raw = critic.smdp_advantage_scores(z, pos_cands, rate_advantage = False)
+    adv_rate = critic.smdp_advantage_scores(z, pos_cands, rate_advantage = True)
+    assert adv_raw.argmax(dim = -1).item() == 1
+    assert adv_rate.argmax(dim = -1).item() == 0
+
+    # negative advantage pair: rate_advantage does not divide negative advantages by duration (-0.8 > -3.86)
+
+    neg_cands = tensor([[2, 3]])
+    smdp_neg = critic.filter_actions(z, neg_cands, rate_advantage = True)
+    assert smdp_neg.actions.item() == 2
+
+
 
 

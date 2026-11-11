@@ -24,11 +24,14 @@ to a factorized actor trained with exact semi-markov GAE:
     delta_k = R_k^(gamma) + gamma^(tau_k) * (1 - term_k) * V(S_{k+1}) - V(S_k)
     A_k     = delta_k + gamma^(tau_k) * lam^(tau_k ^ trace_power) * (1 - done_k) * A_{k+1}
 
-where trace_power = 1. (default clock trace, equal physical lookahead & rich dt mix),
-      trace_power = 0. (decision trace, h-times longer horizon on sparse rewards),
-   or trace_power in (0., 1.) (smooth interpolation, e.g. 0.5 -> sqrt(tau_k) trace).
+and semi-MDP next-latent Q-head candidate action filtering (`use_q_filter = True` by default):
+
+    Q_target_k = calc_smdp_gae(lam = q_lam).returns_k
+    Q_model    = R_hat + (gamma ** tau_hat) * (1 - d_hat) * V(s_hat')
+    Q_eff      = Q_head - 2 * w_cons * max(0, Q_head - Q_model)
 
     uv run train_unified_smdp.py
+    uv run train_unified_smdp.py --compare_q_filter --vq_ckpt_dir ./vq-hierarchical-recording --out_folder ./vq-hierarchical-q-filter
 """
 
 from __future__ import annotations
@@ -63,9 +66,11 @@ from einops.layers.torch import Rearrange
 from vector_quantize_pytorch import VectorQuantize
 
 from x_ppo import (
+    NextLatentQCritic,
     calc_gae,
     clipped_value_loss_fn,
-    hpo_actor_loss
+    hpo_actor_loss,
+    soft_exit_weights
 )
 
 # constants
@@ -238,6 +243,34 @@ class UnifiedHierarchyActor(Module):
         local_code = best_local.gather(-1, best_level[..., None]).squeeze(-1)
         return self.offsets[best_level] + local_code, hier_probs
 
+    def top_candidates(self, state: Tensor, k: int = 6, rel_prob_min: float = 0.2):
+        feat = self.backbone(state)
+        k_eff = min(max(1, k), self.total_actions)
+
+        if not self.factorized:
+            log_probs = self.to_flat_logits(feat).log_softmax(dim = -1)
+            probs = log_probs.exp()
+            hier_probs = stack([c.sum(dim = -1) for c in probs.split(self.action_counts, dim = -1)], dim = -1)
+            top_vals, cand_u = probs.topk(k_eff, dim = -1)
+            cand_mask = top_vals >= (rel_prob_min * top_vals[..., :1])
+            return cand_u, cand_mask, hier_probs
+
+        hier_log_probs = self.to_hier_logits(feat).log_softmax(dim = -1)
+        hier_probs = hier_log_probs.exp()
+        code_log_probs = [head(feat).log_softmax(dim = -1) for head in self.to_code_logits]
+
+        # hierarchy-calibrated plausibility: argmax matches greedy() while avoiding codebook-size bias
+
+        plausibility_lp = cat([
+            hier_lp + (code_lp - code_lp.amax(dim = -1, keepdim = True))
+            for hier_lp, code_lp in zip(hier_log_probs.split(1, dim = -1), code_log_probs)
+        ], dim = -1)
+        plausibility = plausibility_lp.exp()
+
+        top_vals, cand_u = plausibility.topk(k_eff, dim = -1)
+        cand_mask = top_vals >= (rel_prob_min * top_vals[..., :1])
+        return cand_u, cand_mask, hier_probs
+
 # vector quantized action chunks
 
 class ActionChunkVQ(Module):
@@ -398,6 +431,51 @@ class UnifiedHierarchyEnv(gym.Wrapper):
             'last_reward': last_reward
         }
 
+# compositional option embedding across variable horizons (gamma^j sequence, duty cycle, gamma^h)
+
+class CatalogOptionEmbed(Module):
+    def __init__(self, catalog: ActionCatalog, embed_dim = 64, gamma = 0.99):
+        super().__init__()
+        max_h = max(catalog.hierarchies)
+        num_prim = max(4, max(max(seq) for seq in catalog.sequences) + 1)
+        num_hier = len(catalog.hierarchies)
+        hier_to_idx = {h: idx for idx, h in enumerate(catalog.hierarchies)}
+
+        disc_max = sum(gamma ** j for j in range(max_h))
+        feat_dim = max_h * num_prim + num_prim + num_hier + 2
+        feats = zeros((catalog.total_actions, feat_dim), dtype = torch.float32)
+
+        for u, (h, seq) in enumerate(zip(catalog.horizons, catalog.sequences)):
+            seq_mat = zeros((max_h, num_prim), dtype = torch.float32)
+            disc_h = 0.
+
+            for j, prim_a in enumerate(seq):
+                w = gamma ** j
+                seq_mat[j, int(prim_a)] = w
+                disc_h += w
+
+            duty = seq_mat.sum(dim = 0) / max(disc_h, 1e-6)
+            h_onehot = zeros(num_hier, dtype = torch.float32)
+            h_onehot[hier_to_idx[h]] = 1.
+            hor_stats = tensor([disc_h / max(disc_max, 1e-6), gamma ** h], dtype = torch.float32)
+
+            feats[u] = cat((rearrange(seq_mat, 'h a -> (h a)'), duty, h_onehot, hor_stats), dim = 0)
+
+        self.register_buffer('option_features', feats, persistent = False)
+
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU()
+        )
+        self.id_embed = nn.Embedding(catalog.total_actions, embed_dim)
+        nn.init.zeros_(self.id_embed.weight)
+
+    def forward(self, actions: Tensor) -> Tensor:
+        table = self.proj(self.option_features) + self.id_embed.weight
+        return table[actions.long()]
+
 @dataclass
 class SMDPRollout:
     states: Tensor
@@ -408,6 +486,8 @@ class SMDPRollout:
     durations: Tensor
     terminated: Tensor
     truncated: Tensor
+    cand_actions: Tensor | None = None
+    cand_old_log_probs: Tensor | None = None
 
 class SemiMarkovPPO(Module):
     def __init__(
@@ -415,12 +495,22 @@ class SemiMarkovPPO(Module):
         state_dim: int,
         action_counts: tuple[int, ...],
         *,
+        catalog: ActionCatalog | None = None,
         hidden_dim = 64,
         critic_hidden_dim = 192,
         factorized = True,
         use_smdp_gae = True,
         trace_power = 1.,
         marginal_ent_coef = 0.03,
+        use_q_filter = True,
+        q_use_smdp: bool | None = None,
+        num_candidates = 6,
+        q_action_embed_dim = 64,
+        q_lam = 0.8,
+        q_rate_advantage = False,
+        conservative_weight = 0.25,
+        soft_exit_coef = 0.12,
+        soft_exit_kl_budget = 0.25,
         lr = 1e-3,
         critic_lr = 1e-3,
         gamma = 0.99,
@@ -435,8 +525,17 @@ class SemiMarkovPPO(Module):
         self.critic = Critic(state_dim, hidden_dim = critic_hidden_dim)
 
         self.use_smdp_gae = use_smdp_gae
+        self.q_use_smdp = default(q_use_smdp, use_smdp_gae)
         self.trace_power = float(trace_power)
         self.marginal_ent_coef = marginal_ent_coef
+        self.use_q_filter = use_q_filter
+        self.num_candidates = max(1, int(num_candidates))
+        self.q_lam = float(q_lam)
+        self.q_rate_advantage = q_rate_advantage
+        self.conservative_weight = float(conservative_weight)
+        self.soft_exit_coef = float(soft_exit_coef)
+        self.soft_exit_kl_budget = float(soft_exit_kl_budget)
+
         self.base_lr = lr
         self.gamma = gamma
         self.lam = lam
@@ -445,14 +544,73 @@ class SemiMarkovPPO(Module):
         self.epochs = epochs
         self.minibatch_envs = minibatch_envs
 
+        if use_q_filter:
+            option_embed = CatalogOptionEmbed(catalog, embed_dim = q_action_embed_dim, gamma = gamma) if exists(catalog) else None
+            horizons = catalog.horizons_np if (exists(catalog) and self.q_use_smdp) else None
+            self.q_critic = NextLatentQCritic(
+                self.critic,
+                dim_embed = state_dim,
+                num_actions = None if exists(option_embed) else sum(action_counts),
+                action_embed = option_embed,
+                action_embed_dim = q_action_embed_dim,
+                action_horizons = horizons,
+                discrete_actions = True,
+                hidden_dim = critic_hidden_dim,
+                depth = 2,
+                gamma = gamma,
+                next_latent_coef = 0.25,
+                q_coef = 1.,
+                value_coef = 1.,
+                reward_coef = 0.5,
+                terminal_coef = 0.25,
+                duration_coef = 0.25
+            )
+            value_param_ids = {id(p) for p in self.critic.parameters()}
+            self._q_trunk_params = [p for p in self.q_critic.parameters() if id(p) not in value_param_ids]
+            self.opt_critic = torch.optim.AdamW(self.q_critic.parameters(), lr = critic_lr)
+        else:
+            self.q_critic = None
+            self._q_trunk_params = []
+            self.opt_critic = torch.optim.AdamW(self.critic.parameters(), lr = critic_lr)
+
         self.opt_actor = torch.optim.AdamW(self.actor.parameters(), lr = lr)
-        self.opt_critic = torch.optim.AdamW(self.critic.parameters(), lr = critic_lr)
 
     def set_lr_scale(self, scale: float):
         for pg in self.opt_actor.param_groups:
             pg['lr'] = self.base_lr * scale
 
-    def update(self, rollout: SMDPRollout, entropy_coef = 0.005):
+    @torch.no_grad()
+    def sample_rollout_action(self, state: Tensor, filter_prob: float = 0.):
+        if not exists(self.q_critic):
+            act, lp = self.actor.sample(state)
+            return act, lp, None, None
+
+        joint_lp, *_ = self.actor(state)
+        dist = Categorical(logits = joint_lp, validate_args = False)
+        cand_u = rearrange(dist.sample((self.num_candidates,)), 'k b -> b k')
+        cand_lp = joint_lp.gather(-1, cand_u)
+
+        base_u, base_lp = cand_u[:, 0], cand_lp[:, 0]
+        if filter_prob <= 0. or self.num_candidates <= 1:
+            return base_u, base_lp, cand_u, cand_lp
+
+        filtered = self.q_critic.filter_actions(
+            state,
+            cand_u,
+            candidate_log_probs = cand_lp,
+            rate_advantage = self.q_rate_advantage,
+            conservative_weight = self.conservative_weight
+        )
+
+        if filter_prob >= 1.:
+            return filtered.actions, filtered.log_probs, cand_u, cand_lp
+
+        use_f = torch.rand(state.shape[0], device = state.device) < filter_prob
+        act = torch.where(use_f, filtered.actions, base_u)
+        lp = torch.where(use_f, filtered.log_probs, base_lp)
+        return act, lp, cand_u, cand_lp
+
+    def update(self, rollout: SMDPRollout, entropy_coef = 0.005, distill_active = True):
         num_envs = rollout.states.shape[0]
 
         with torch.no_grad():
@@ -472,6 +630,35 @@ class SemiMarkovPPO(Module):
                 return_advantages = True
             )
 
+            q_gae = None
+            cand_adv = None
+
+            if exists(self.q_critic):
+                q_gae = calc_gae(
+                    rewards = rollout.rewards,
+                    values = values,
+                    next_values = next_values,
+                    terminated = rollout.terminated,
+                    truncated = rollout.truncated,
+                    durations = rollout.durations if self.q_use_smdp else None,
+                    trace_power = self.trace_power,
+                    gamma = self.gamma,
+                    lam = self.q_lam,
+                    use_accelerated = False,
+                    return_advantages = True
+                )
+
+                if distill_active and self.soft_exit_coef > 0. and exists(rollout.cand_actions) and rollout.cand_actions.shape[-1] > 1:
+                    cand_scores = self.q_critic.smdp_advantage_scores(
+                        rollout.states,
+                        rollout.cand_actions,
+                        rate_advantage = self.q_rate_advantage,
+                        conservative_weight = self.conservative_weight
+                    )
+                    cand_weights = soft_exit_weights(cand_scores, kl_budget = self.soft_exit_kl_budget)
+                    k_cands = rollout.cand_actions.shape[-1]
+                    cand_adv = (cand_weights - (1. / k_cands)) * k_cands
+
         self.train()
         for _ in range(self.epochs):
             perm = torch.randperm(num_envs, device = rollout.states.device)
@@ -490,6 +677,20 @@ class SemiMarkovPPO(Module):
                 log_probs = joint_lp.gather(-1, mb_a[..., None]).squeeze(-1)
                 surr_loss = hpo_actor_loss(log_probs, mb_old_lp, mb_adv, eps_clip = self.eps_clip, normalize_advantages = True).mean()
 
+                if exists(cand_adv):
+                    mb_cand_u = rearrange(rollout.cand_actions[mb], 'b t k -> (b t) k')
+                    mb_cand_old_lp = rearrange(rollout.cand_old_log_probs[mb], 'b t k -> (b t) k')
+                    mb_cand_adv = rearrange(cand_adv[mb], 'b t k -> (b t) k')
+                    new_cand_lp = joint_lp.gather(-1, mb_cand_u)
+                    exit_loss = hpo_actor_loss(
+                        new_cand_lp,
+                        mb_cand_old_lp,
+                        mb_cand_adv,
+                        eps_clip = self.eps_clip,
+                        normalize_advantages = False
+                    ).mean()
+                    surr_loss = surr_loss + self.soft_exit_coef * exit_loss
+
                 if self.actor.factorized:
                     state_ent = 0.5 * (normalized_entropy(hier_probs) + within_ent).mean()
                     marginal_ent = normalized_entropy(hier_probs.mean(dim = 0))
@@ -504,10 +705,32 @@ class SemiMarkovPPO(Module):
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.opt_actor.step()
 
-                critic_loss = clipped_value_loss_fn(self.critic(mb_s), mb_val, mb_ret, clip = None)
-                self.opt_critic.zero_grad()
-                critic_loss.backward()
-                self.opt_critic.step()
+                if exists(self.q_critic):
+                    mb_ns = rearrange(rollout.next_states[mb], 'b k d -> (b k) d')
+                    mb_r = rearrange(rollout.rewards[mb], 'b k -> (b k)')
+                    mb_dur = rearrange(rollout.durations[mb], 'b k -> (b k)')
+                    mb_term = rearrange(rollout.terminated[mb], 'b k -> (b k)')
+                    mb_q_ret = rearrange(q_gae.returns[mb], 'b k -> (b k)')
+
+                    critic_loss = self.q_critic(
+                        mb_s,
+                        mb_a,
+                        rewards = mb_r,
+                        next_embeddings = mb_ns,
+                        returns = mb_ret,
+                        dones = mb_term,
+                        durations = mb_dur if self.q_use_smdp else None,
+                        q_targets = mb_q_ret
+                    )
+                    self.opt_critic.zero_grad()
+                    critic_loss.backward()
+                    nn.utils.clip_grad_norm_(self._q_trunk_params, 1.)
+                    self.opt_critic.step()
+                else:
+                    critic_loss = clipped_value_loss_fn(self.critic(mb_s), mb_val, mb_ret, clip = None)
+                    self.opt_critic.zero_grad()
+                    critic_loss.backward()
+                    self.opt_critic.step()
 
 # stage 1: dt = 1 ppo + intermittent vq action-chunk discovery
 
@@ -537,7 +760,7 @@ def discover_vq_codebooks(
 
         ppo = SemiMarkovPPO(
             state_dim, (num_actions,),
-            hidden_dim = 108, factorized = False, use_smdp_gae = False,
+            hidden_dim = 108, factorized = False, use_smdp_gae = False, use_q_filter = False,
             lr = 1e-3, critic_lr = 2.5e-3
         ).to(device)
 
@@ -629,6 +852,17 @@ def train_unified_variant(
     use_smdp_gae: bool,
     marginal_ent_coef: float,
     trace_power = 1.,
+    use_q_filter = True,
+    q_use_smdp: bool | None = None,
+    num_candidates = 6,
+    q_lam = 0.8,
+    q_filter_prob = 0.5,
+    q_warmup_frac = 0.08,
+    q_rate_advantage = False,
+    conservative_weight = 0.25,
+    soft_exit_coef = 0.12,
+    soft_exit_kl_budget = 0.25,
+    eval_rel_prob_min = 0.2,
     env_step_budget = 800_000,
     env_name = 'LunarLander-v3',
     num_envs = 16,
@@ -652,10 +886,19 @@ def train_unified_variant(
         state_dim = env.single_observation_space.shape[0]
         ppo = SemiMarkovPPO(
             state_dim, catalog.counts,
+            catalog = catalog,
             factorized = factorized,
             use_smdp_gae = use_smdp_gae,
             trace_power = trace_power,
             marginal_ent_coef = marginal_ent_coef,
+            use_q_filter = use_q_filter,
+            q_use_smdp = q_use_smdp,
+            num_candidates = num_candidates,
+            q_lam = q_lam,
+            q_rate_advantage = q_rate_advantage,
+            conservative_weight = conservative_weight,
+            soft_exit_coef = soft_exit_coef,
+            soft_exit_kl_budget = soft_exit_kl_budget,
             lr = lr, critic_lr = critic_lr,
             gamma = gamma, lam = lam
         ).to(device)
@@ -665,6 +908,7 @@ def train_unified_variant(
         running, recent, history = np.zeros(num_envs), [], []
         best_rolling = -float('inf')
         best_actor_state = deepcopy(ppo.actor.state_dict())
+        best_q_critic_state = deepcopy(ppo.q_critic.state_dict()) if exists(ppo.q_critic) else None
         env_steps, upd, t0 = 0, 0, time.time()
 
         while env_steps < env_step_budget:
@@ -673,7 +917,11 @@ def train_unified_variant(
             ppo.set_lr_scale(schedule_at(LR_SCALE_SCHEDULE, progress))
             ent_coef = schedule_at(ENTROPY_SCHEDULE, progress)
 
+            warmed_up = progress >= q_warmup_frac
+            active_filter_prob = q_filter_prob if (use_q_filter and warmed_up) else 0.
+
             states, next_states, actions, log_probs = [], [], [], []
+            cand_actions, cand_log_probs = [], []
             rewards, durations, terms, truncs = [], [], [], []
             ep_rets = []
             h_counts = {h: 0 for h in catalog.hierarchies}
@@ -681,7 +929,7 @@ def train_unified_variant(
             ppo.eval()
             for _ in range(rollout_decisions):
                 with torch.no_grad():
-                    act_t, lp_t = ppo.actor.sample(state)
+                    act_t, lp_t, cand_u_t, cand_lp_t = ppo.sample_rollout_action(state, filter_prob = active_filter_prob)
 
                 act_np = act_t.cpu().numpy()
                 next_obs, disc_r, terminated, truncated, info = env.step(act_np)
@@ -705,6 +953,9 @@ def train_unified_variant(
                 next_states.append(torch.from_numpy(true_next_obs(next_obs, done, info)).float().to(device))
                 actions.append(act_t)
                 log_probs.append(lp_t)
+                if exists(cand_u_t):
+                    cand_actions.append(cand_u_t)
+                    cand_log_probs.append(cand_lp_t)
                 rewards.append(torch.from_numpy(disc_r / 100.).float().to(device))
                 durations.append(torch.from_numpy(durs).float().to(device))
                 terms.append(torch.from_numpy(terminated).bool().to(device))
@@ -719,8 +970,10 @@ def train_unified_variant(
                 rewards = stack(rewards, dim = 1),
                 durations = stack(durations, dim = 1),
                 terminated = stack(terms, dim = 1),
-                truncated = stack(truncs, dim = 1)
-            ), entropy_coef = ent_coef)
+                truncated = stack(truncs, dim = 1),
+                cand_actions = stack(cand_actions, dim = 1) if cand_actions else None,
+                cand_old_log_probs = stack(cand_log_probs, dim = 1) if cand_log_probs else None
+            ), entropy_coef = ent_coef, distill_active = warmed_up)
 
             rec32 = float(np.mean(recent[-32:])) if recent else float('nan')
             upd_ret = float(np.mean(ep_rets)) if ep_rets else rec32
@@ -728,39 +981,98 @@ def train_unified_variant(
             if not np.isnan(rec32) and rec32 > best_rolling:
                 best_rolling = rec32
                 best_actor_state = deepcopy(ppo.actor.state_dict())
+                if exists(ppo.q_critic):
+                    best_q_critic_state = deepcopy(ppo.q_critic.state_dict())
 
             tot_dec = max(1, sum(h_counts.values()))
             dec_pct = {h: 100. * h_counts[h] / tot_dec for h in catalog.hierarchies}
-            history.append(dict(variant = name, update = upd, env_steps = env_steps, recent_return_32 = rec32, update_return = upd_ret, dec_pct = dec_pct))
+            history.append(dict(variant = name, seed = seed, update = upd, env_steps = env_steps, recent_return_32 = rec32, update_return = upd_ret, dec_pct = dec_pct))
 
             if divisible_by(upd, 10) or env_steps >= env_step_budget:
                 mix_str = ' '.join(f'dt{h}:{dec_pct[h]:4.1f}%' for h in catalog.hierarchies)
-                print(f'  [{name:12s} upd {upd:2d}] steps = {env_steps // 1000:3d}k | ret32 = {rec32:+6.1f} (best = {best_rolling:+6.1f}) | {mix_str} [{time.time() - t0:.1f}s]', flush = True)
+                print(f'  [{name:14s} upd {upd:2d}] steps = {env_steps // 1000:3d}k | ret32 = {rec32:+6.1f} (best = {best_rolling:+6.1f}) | {mix_str} [{time.time() - t0:.1f}s]', flush = True)
 
         env.close()
 
     ppo.actor.load_state_dict(best_actor_state)
-    eval_stats = evaluate_policy(ppo.actor, catalog, env_name = env_name, max_episode_steps = max_episode_steps)
+    if exists(ppo.q_critic) and exists(best_q_critic_state):
+        ppo.q_critic.load_state_dict(best_q_critic_state)
+
+    eval_stats = evaluate_policy(
+        ppo.actor, catalog,
+        q_critic = ppo.q_critic,
+        num_candidates = num_candidates,
+        rel_prob_min = eval_rel_prob_min,
+        rate_advantage = q_rate_advantage,
+        conservative_weight = conservative_weight,
+        env_name = env_name,
+        max_episode_steps = max_episode_steps
+    )
     eval_stats['peak_rolling_32'] = best_rolling
-    return history, ppo.actor, eval_stats
+
+    if exists(ppo.q_critic):
+        actor_only = evaluate_policy(
+            ppo.actor, catalog,
+            q_critic = None,
+            env_name = env_name,
+            max_episode_steps = max_episode_steps
+        )
+        eval_stats['actor_only_mean_return'] = actor_only['mean_return']
+        eval_stats['actor_only_land_rate'] = actor_only['land_rate']
+
+    return history, ppo, eval_stats
 
 # evaluation, hud video rendering & summary plot
+
+@torch.no_grad()
+def select_eval_action(
+    actor: UnifiedHierarchyActor,
+    state: Tensor,
+    q_critic: NextLatentQCritic | None = None,
+    num_candidates: int = 6,
+    rel_prob_min: float = 0.2,
+    rate_advantage: bool = False,
+    conservative_weight: float = 0.25
+):
+    if not exists(q_critic) or num_candidates <= 1:
+        return actor.greedy(state)
+
+    cand_u, cand_mask, hier_probs = actor.top_candidates(state, k = num_candidates, rel_prob_min = rel_prob_min)
+    if not bool(cand_mask[:, 1:].any()):
+        return cand_u[:, 0], hier_probs
+
+    filtered = q_critic.filter_actions(
+        state,
+        cand_u,
+        rate_advantage = rate_advantage,
+        conservative_weight = conservative_weight,
+        candidate_mask = cand_mask
+    )
+    return filtered.actions, hier_probs
 
 @torch.no_grad()
 def evaluate_policy(
     actor: UnifiedHierarchyActor,
     catalog: ActionCatalog,
+    q_critic: NextLatentQCritic | None = None,
+    num_candidates = 6,
+    rel_prob_min = 0.2,
+    rate_advantage = False,
+    conservative_weight = 0.25,
     env_name = 'LunarLander-v3',
     max_episode_steps = 600,
     num_episodes = 48,
     seed = 1000
 ) -> dict:
     actor.eval()
+    if exists(q_critic):
+        q_critic.eval()
     env = gym.make(env_name, max_episode_steps = max_episode_steps)
 
     returns, landed, ranked_seeds = [], [], []
     dec_by_h = {h: 0 for h in catalog.hierarchies}
     step_by_h = {h: 0 for h in catalog.hierarchies}
+    q_overrides = 0
     best_segments, best_score = [], -float('inf')
 
     for ep in range(num_episodes):
@@ -770,7 +1082,19 @@ def evaluate_policy(
         used_h, segments = set(), []
 
         while not done:
-            u_t, _ = actor.greedy(torch.from_numpy(obs).float().unsqueeze(0).to(device))
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+            u_t, _ = select_eval_action(
+                actor, obs_t,
+                q_critic = q_critic,
+                num_candidates = num_candidates,
+                rel_prob_min = rel_prob_min,
+                rate_advantage = rate_advantage,
+                conservative_weight = conservative_weight
+            )
+            if exists(q_critic):
+                greedy_u, _ = actor.greedy(obs_t)
+                q_overrides += int(u_t.item() != greedy_u.item())
+
             u = int(u_t.item())
             h, seq = catalog.horizons[u], catalog.sequences[u]
 
@@ -805,8 +1129,10 @@ def evaluate_policy(
     return dict(
         mean_return = float(np.mean(returns)),
         std_return = float(np.std(returns)),
+        median_return = float(np.median(returns)),
         best_return = float(max(returns)),
         land_rate = 100. * float(np.mean(landed)),
+        q_override_pct = 100. * q_overrides / tot_dec if exists(q_critic) else 0.,
         top_seeds = [s for _, _, s in ranked_seeds],
         dec_frac = {h: 100. * dec_by_h[h] / tot_dec for h in catalog.hierarchies},
         step_frac = {h: 100. * step_by_h[h] / tot_step for h in catalog.hierarchies},
@@ -820,17 +1146,32 @@ def render_mixed_video(
     seed: int,
     mp4_path: str | Path,
     gif_path: str | Path,
+    q_critic: NextLatentQCritic | None = None,
+    num_candidates = 6,
+    rel_prob_min = 0.2,
+    rate_advantage = False,
+    conservative_weight = 0.25,
     env_name = 'LunarLander-v3',
     max_episode_steps = 600
 ) -> dict:
     actor.eval()
+    if exists(q_critic):
+        q_critic.eval()
     env = gym.make(env_name, render_mode = 'rgb_array', max_episode_steps = max_episode_steps)
     obs, _ = env.reset(seed = seed)
 
     records, done, ep_ret, dec_idx = [], False, 0., 0
 
     while not done:
-        u_t, hier_probs_t = actor.greedy(torch.from_numpy(obs).float().unsqueeze(0).to(device))
+        obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+        u_t, hier_probs_t = select_eval_action(
+            actor, obs_t,
+            q_critic = q_critic,
+            num_candidates = num_candidates,
+            rel_prob_min = rel_prob_min,
+            rate_advantage = rate_advantage,
+            conservative_weight = conservative_weight
+        )
         u = int(u_t.item())
         h, code, seq = catalog.horizons[u], catalog.local_codes[u], catalog.sequences[u]
         h_probs = hier_probs_t.squeeze(0).cpu().numpy()
@@ -919,11 +1260,17 @@ def render_mixed_video(
 
 def plot_results(histories: dict[str, list[dict]], evals: dict[str, dict], hierarchies: tuple[int, ...], out_path: Path):
     fig, axes = plt.subplots(1, 3, figsize = (17.5, 5.2), dpi = 150)
-    colors = {'naive_flat': '#7f8c8d', 'smdp_pure': '#2b6cb0', 'smdp_diverse': '#d62828'}
+    colors = {
+        'naive_flat': '#7f8c8d',
+        'smdp_pure': '#2b6cb0',
+        'smdp_diverse': '#d62828',
+        'smdp_q_filter': '#0f766e'
+    }
     titles = {
         'naive_flat': 'Naive Flat 60-Way (gamma^1, lam^1)',
         'smdp_pure': 'SMDP-GAE (gamma^tau, lam_k)',
-        'smdp_diverse': 'SMDP-GAE + Marginal Diversity'
+        'smdp_diverse': 'SMDP-GAE + Marginal Diversity (No Q-Filter)',
+        'smdp_q_filter': 'SMDP-GAE + Q-Head Candidate Filter'
     }
 
     for k, rows in histories.items():
@@ -935,7 +1282,8 @@ def plot_results(histories: dict[str, list[dict]], evals: dict[str, dict], hiera
     axes[0].legend(loc = 'lower right', fontsize = 8)
     axes[0].grid(alpha = 0.25)
 
-    div_rows = histories['smdp_diverse']
+    primary_key = 'smdp_q_filter' if 'smdp_q_filter' in histories else ('smdp_diverse' if 'smdp_diverse' in histories else next(iter(histories)))
+    div_rows = histories[primary_key]
     axes[1].stackplot(
         [r['env_steps'] / 1e3 for r in div_rows],
         *[[r['dec_pct'][h] for r in div_rows] for h in hierarchies],
@@ -943,10 +1291,10 @@ def plot_results(histories: dict[str, list[dict]], evals: dict[str, dict], hiera
         colors = [HIER_COLORS_HEX.get(h, '#555555') for h in hierarchies],
         alpha = 0.85
     )
-    axes[1].set(ylim = (0, 100), xlabel = 'primitive env steps (k)', ylabel = 'decision share (%)', title = 'Hierarchy Mix Over Training')
+    axes[1].set(ylim = (0, 100), xlabel = 'primitive env steps (k)', ylabel = 'decision share (%)', title = f'Hierarchy Mix ({primary_key})')
     axes[1].legend(loc = 'upper right', fontsize = 8)
 
-    segs = evals['smdp_diverse']['best_segments']
+    segs = evals[primary_key]['best_segments']
     lines = [[pts[i], pts[i + 1]] for _, pts in segs for i in range(len(pts) - 1)]
     cols = [HIER_COLORS_HEX.get(h, '#555555') for h, pts in segs for _ in range(len(pts) - 1)]
     if lines:
@@ -955,9 +1303,9 @@ def plot_results(histories: dict[str, list[dict]], evals: dict[str, dict], hiera
     axes[2].axvline(-0.2, color = '#2ecc71', linestyle = '--', linewidth = 1.)
     axes[2].axvline(0.2, color = '#2ecc71', linestyle = '--', linewidth = 1.)
     axes[2].axhline(0., color = '#555555', linewidth = 1.)
-    ev_d = evals['smdp_diverse']
+    ev_d = evals[primary_key]
     axes[2].legend(handles = [Patch(color = HIER_COLORS_HEX.get(h, '#555555'), label = f'dt={h}: {ev_d["dec_frac"][h]:.1f}% dec') for h in hierarchies], loc = 'upper right', fontsize = 8)
-    axes[2].set(xlim = (-0.75, 0.75), ylim = (-0.08, 1.5), xlabel = 'x', ylabel = 'y', title = 'Mixed-Hierarchy Trajectory')
+    axes[2].set(xlim = (-0.75, 0.75), ylim = (-0.08, 1.5), xlabel = 'x', ylabel = 'y', title = f'Mixed-Hierarchy Trajectory ({primary_key})')
     axes[2].grid(alpha = 0.25)
 
     plt.tight_layout()
@@ -976,6 +1324,18 @@ def main(
     env_step_budget = 800_000,
     marginal_ent_coef = 0.03,
     trace_power = 1.,
+    use_q_filter = True,
+    compare_q_filter = False,
+    q_use_smdp: bool | None = None,
+    num_candidates = 6,
+    q_lam = 0.8,
+    q_filter_prob = 0.5,
+    q_warmup_frac = 0.08,
+    q_rate_advantage = False,
+    conservative_weight = 0.25,
+    soft_exit_coef = 0.12,
+    soft_exit_kl_budget = 0.25,
+    eval_rel_prob_min = 0.2,
     compare_ablations = False,
     num_videos = 3,
     seed = 42
@@ -1004,52 +1364,84 @@ def main(
     variants = []
     if compare_ablations:
         variants.extend([
-            ('naive_flat', False, False, 0.),
-            ('smdp_pure', True, True, 0.)
+            ('naive_flat', False, False, 0., False),
+            ('smdp_pure', True, True, 0., False)
         ])
-    variants.append(('smdp_diverse', True, True, marginal_ent_coef))
+    if compare_q_filter:
+        variants.extend([
+            ('smdp_diverse', True, True, marginal_ent_coef, False),
+            ('smdp_q_filter', True, True, marginal_ent_coef, True)
+        ])
+    elif use_q_filter:
+        variants.append(('smdp_q_filter', True, True, marginal_ent_coef, True))
+    else:
+        variants.append(('smdp_diverse', True, True, marginal_ent_coef, False))
 
-    histories, actors, evals = {}, {}, {}
+    histories, agents, evals = {}, {}, {}
 
-    for name, factorized, use_smdp, marg_coef in variants:
-        hist, actor, ev = train_unified_variant(
+    for name, factorized, use_smdp, marg_coef, q_filt in variants:
+        hist, ppo_agent, ev = train_unified_variant(
             name = name,
             catalog = catalog,
             factorized = factorized,
             use_smdp_gae = use_smdp,
             marginal_ent_coef = marg_coef,
             trace_power = trace_power,
+            use_q_filter = q_filt,
+            q_use_smdp = q_use_smdp,
+            num_candidates = num_candidates,
+            q_lam = q_lam,
+            q_filter_prob = q_filter_prob,
+            q_warmup_frac = q_warmup_frac,
+            q_rate_advantage = q_rate_advantage,
+            conservative_weight = conservative_weight,
+            soft_exit_coef = soft_exit_coef,
+            soft_exit_kl_budget = soft_exit_kl_budget,
+            eval_rel_prob_min = eval_rel_prob_min,
             env_step_budget = env_step_budget,
             env_name = env_name,
             seed = seed
         )
-        histories[name], actors[name], evals[name] = hist, actor, ev
+        histories[name], agents[name], evals[name] = hist, ppo_agent, ev
         mix = ' '.join(f'dt{h}:{ev["dec_frac"][h]:.1f}%' for h in catalog.hierarchies)
-        print(f'  [{name:12s} eval] {ev["mean_return"]:+.1f} +/- {ev["std_return"]:.1f} (best {ev["best_return"]:+.1f}) | {mix}', flush = True)
+        extra = f' | actor_only {ev["actor_only_mean_return"]:+.1f} | q_override {ev["q_override_pct"]:.1f}%' if q_filt else ''
+        print(f'  [{name:14s} eval] {ev["mean_return"]:+.1f} +/- {ev["std_return"]:.1f} (land {ev["land_rate"]:.1f}%, best {ev["best_return"]:+.1f}) | {mix}{extra}', flush = True)
 
     with open(out_dir / 'unified_smdp_curves.csv', 'w', newline = '') as f:
         writer = csv.writer(f)
-        writer.writerow(['variant', 'update', 'env_steps', 'recent_return_32', 'update_return', *[f'dec_pct_h{h}' for h in catalog.hierarchies]])
+        writer.writerow(['variant', 'seed', 'update', 'env_steps', 'recent_return_32', 'update_return', *[f'dec_pct_h{h}' for h in catalog.hierarchies]])
         for rows in histories.values():
             for r in rows:
-                writer.writerow([r['variant'], r['update'], r['env_steps'], r['recent_return_32'], r['update_return'], *[r['dec_pct'][h] for h in catalog.hierarchies]])
+                writer.writerow([r['variant'], r['seed'], r['update'], r['env_steps'], r['recent_return_32'], r['update_return'], *[r['dec_pct'][h] for h in catalog.hierarchies]])
 
+    primary_key = 'smdp_q_filter' if 'smdp_q_filter' in agents else next(reversed(agents))
+    primary_agent = agents[primary_key]
     videos = []
-    for i, sd in enumerate(evals['smdp_diverse']['top_seeds'][:max(1, num_videos)]):
-        stem = 'unified-smdp-mixed-best' if i == 0 else f'unified-smdp-mixed-rank{i + 1}-s{sd}'
-        videos.append(render_mixed_video(
-            actors['smdp_diverse'], catalog, sd,
-            out_dir / f'{stem}.mp4', out_dir / f'{stem}.gif',
-            env_name = env_name
-        ))
+    if num_videos > 0:
+        for i, sd in enumerate(evals[primary_key]['top_seeds'][:num_videos]):
+            prefix = 'unified-smdp-q-filter' if primary_key == 'smdp_q_filter' else 'unified-smdp-mixed'
+            stem = f'{prefix}-best' if i == 0 else f'{prefix}-rank{i + 1}-s{sd}'
+            videos.append(render_mixed_video(
+                primary_agent.actor, catalog, sd,
+                out_dir / f'{stem}.mp4', out_dir / f'{stem}.gif',
+                q_critic = primary_agent.q_critic,
+                num_candidates = num_candidates,
+                rel_prob_min = eval_rel_prob_min,
+                rate_advantage = q_rate_advantage,
+                conservative_weight = conservative_weight,
+                env_name = env_name
+            ))
 
     plot_results(histories, evals, catalog.hierarchies, out_dir / 'unified_smdp_results.png')
 
     torch.save(dict(
         codebooks = codebooks,
         evals = evals,
+        histories = histories,
         videos = videos,
-        actor = actors['smdp_diverse'].state_dict()
+        actor = primary_agent.actor.state_dict(),
+        critic = primary_agent.critic.state_dict(),
+        q_critic = primary_agent.q_critic.state_dict() if exists(primary_agent.q_critic) else None
     ), out_dir / 'ppo_unified_smdp.pt')
 
 if __name__ == '__main__':
