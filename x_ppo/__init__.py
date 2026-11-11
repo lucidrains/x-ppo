@@ -14,6 +14,7 @@ from x_ppo.spo import spo_actor_loss
 from x_ppo.values import (
     GAE,
     calc_gae,
+    calc_smdp_gae,
     calc_returns,
     clipped_value_loss_fn,
     combine_grouped_advantages,
@@ -30,6 +31,7 @@ __all__ = [
     'QCriticLosses',
     'SoftExitStats',
     'calc_gae',
+    'calc_smdp_gae',
     'calc_returns',
     'clipped_value_loss_fn',
     'combine_grouped_advantages',

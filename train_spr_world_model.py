@@ -553,7 +553,7 @@ def main(
     gamma = 0.99,
     lam = 0.95,
     eps_clip = 0.3,
-    advantage_clip = 1.,
+    target_scale = 1.25,
     value_clip = 0.2,
     ent_coef = 0.01,
     vf_coef = 0.5,
@@ -762,7 +762,7 @@ def main(
                     old_log_probs[mb_idx],
                     advantages[mb_idx],
                     eps_clip = eps_clip,
-                    advantage_clip = advantage_clip,
+                    target_scale = target_scale,
                     per_action_dim = True,
                     normalize_advantages = mb_norm_advantages
                 ).mean()

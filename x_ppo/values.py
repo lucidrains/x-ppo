@@ -212,8 +212,13 @@ def calc_gae(
     terminated: Tensor | None = None,         # (b n) gymnasium termination - no bootstrap, cut gae
     truncated: Tensor | None = None,          # (b n) gymnasium truncation - bootstrap, cut gae
     chunk_size: int | tuple[int, ...] | list[int] = 1,
+    durations: Tensor | None = None,          # (b n) semi-markov option durations tau_k >= 1
+    trace_power: float = 1.,                  # 1.: lam^tau clock trace; 0.: lam^1 decision trace; (0, 1): interpolated
     finite_time: bool = False                 # normalize geometric weights over the remaining rollout
 ) -> Tensor | GAE | tuple[Tensor | GAE, ...]:
+    if exists(durations) and (isinstance(chunk_size, (tuple, list)) or chunk_size > 1):
+        raise ValueError('`durations` (semi-markov gae) cannot be combined with `chunk_size` > 1')
+
     if isinstance(chunk_size, (tuple, list)):
         return tuple(
             calc_gae(
@@ -264,9 +269,9 @@ def calc_gae(
     is_single_sequence = rewards.ndim == 1
 
     if is_single_sequence:
-        rewards, values, masks, done_masks, next_values, gamma, lam = tree_map_tensor(
+        rewards, values, masks, done_masks, next_values, gamma, lam, durations = tree_map_tensor(
             lambda t: t[None] if t.ndim == 1 else t,
-            (rewards, values, masks, done_masks, next_values, gamma, lam)
+            (rewards, values, masks, done_masks, next_values, gamma, lam, durations)
         )
 
     grouped = rewards.ndim > 2
@@ -282,14 +287,15 @@ def calc_gae(
         rewards = rewards.movedim(group_dim, -2)
         values = align_group_dim(values, group_dim)
         next_values = align_group_dim(next_values, group_dim) if exists(next_values) else next_values
+        durations = align_group_dim(durations, group_dim) if exists(durations) else durations
 
         masks = align_group_dim(masks, group_dim)
         done_masks = align_group_dim(done_masks, group_dim)
 
     seq_len = rewards.shape[-1]
 
-    values, next_values, masks, done_masks, gamma, lam, lens = tree_map_tensor_to_device(
-        (values, next_values, masks, done_masks, gamma, lam, lens),
+    values, next_values, masks, done_masks, gamma, lam, durations, lens = tree_map_tensor_to_device(
+        (values, next_values, masks, done_masks, gamma, lam, durations, lens),
         device
     )
 
@@ -356,6 +362,19 @@ def calc_gae(
 
     if is_tensor(masks):
         next_values = next_values.masked_fill(masks == 0., 0.)
+
+    # semi-markov option durations: discount by gamma^tau and decay trace by lam^(tau ^ trace_power)
+
+    if exists(durations):
+        durations = durations.to(dtype = dtype)
+        if exists(len_mask):
+            durations = durations.masked_fill(~len_mask, 1.)
+
+        gamma = pad_right_ndim_to(as_tensor(gamma, device = device, dtype = dtype), durations.ndim) ** durations
+
+        if trace_power != 0.:
+            eff_dur = durations if trace_power == 1. else durations.pow(trace_power)
+            lam = pad_right_ndim_to(as_tensor(lam, device = device, dtype = dtype), durations.ndim) ** eff_dur
 
     # discount factors and lambdas may differ across the batch
 
@@ -431,6 +450,30 @@ def calc_gae(
     returns, gae = tree_map_tensor(remove_batch_dim, (returns, gae))
 
     return GAE(returns, gae)
+
+# semi-markov generalized advantage estimation - Sutton et al. + Schulman et al.
+
+def calc_smdp_gae(
+    rewards: Tensor,                          # (b n) within-option discounted reward sum_{j=0}^{tau-1} gamma^j r_{t+j}
+    values: Tensor,                           # (b n) or (b n + 1)
+    durations: Tensor,                        # (b n) elapsed primitive steps tau_k >= 1
+    *,
+    gamma: float | Tensor = 0.99,
+    lam: float | Tensor = 0.95,
+    trace_power: float = 1.,                  # 1.: clock trace lam^tau; 0.: decision trace lam^1; (0, 1): interpolated
+    return_advantages: bool = True,
+    **kwargs
+) -> Tensor | GAE:
+    return calc_gae(
+        rewards = rewards,
+        values = values,
+        durations = durations,
+        gamma = gamma,
+        lam = lam,
+        trace_power = trace_power,
+        return_advantages = return_advantages,
+        **kwargs
+    )
 
 # returns
 

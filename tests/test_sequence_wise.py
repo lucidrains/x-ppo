@@ -175,14 +175,14 @@ def test_hpo_sequence_wise_matches_reference():
     log_probs, old_log_probs, cumulative_rewards, mask = sequence_inputs()
 
     eps_low, eps_high = 0.2, 0.3
-    advantage_clip = 2.
+    target_scale = 1.5
 
     loss = hpo_actor_loss(
         log_probs,
         old_log_probs,
         cumulative_rewards,
         eps_clip = (eps_low, eps_high),
-        advantage_clip = advantage_clip,
+        target_scale = target_scale,
         mask = mask,
         normalize_advantages = True,
         sequence_wise = True
@@ -191,8 +191,9 @@ def test_hpo_sequence_wise_matches_reference():
     advantages = z_score(cumulative_rewards)
     log_ratios = ((log_probs - old_log_probs) * mask).sum(dim = -1) / mask.sum(dim = -1)
 
-    eps = torch.where(advantages >= 0., eps_high, eps_low)
-    target = eps * advantages.clamp(-advantage_clip, advantage_clip)
+    is_pos = advantages >= 0.
+    eps = torch.where(is_pos, eps_high, eps_low)
+    target = target_scale * eps * torch.where(is_pos, 1., -1.)
     weight = advantages.abs()
 
     error = log_ratios - target

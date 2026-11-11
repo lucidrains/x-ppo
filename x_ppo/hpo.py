@@ -10,12 +10,12 @@ def hpo_actor_loss(
     old_action_log_probs,
     advantages,
     eps_clip = 0.2,
+    target_scale = 1.25,
     mask = None,
     normalize_advantages = False,
     delightful = False,
     delight_temp = 1.,
     log_ratio_clamp = None,
-    advantage_clip = 2.,
     per_action_dim = False,
     group_dim = -2,
     min_advantage_std = 1e-6,
@@ -42,23 +42,30 @@ def hpo_actor_loss(
     advantages = inputs.advantages
 
     eps_clip_low, eps_clip_high = cast_tuple(eps_clip, 2)
+    target_scale_low, target_scale_high = cast_tuple(target_scale, 2)
+
+    if min(target_scale_low, target_scale_high) < 1.:
+        raise ValueError('target_scale must be >= 1. to preserve exact on-policy gradient')
 
     if exists(log_ratio_clamp):
         clamp_low, clamp_high = log_ratio_clamp
-        bound = 2 * max(eps_clip_low, eps_clip_high)
+        min_low = -(target_scale_low + 1.) * eps_clip_low
+        min_high = (target_scale_high + 1.) * eps_clip_high
 
-        if clamp_low > -bound or clamp_high < bound:
-            raise ValueError(f'log_ratio_clamp too tight for hpo - needs ({-bound}, {bound})')
+        if clamp_low > min_low or clamp_high < min_high:
+            raise ValueError(f'log_ratio_clamp too tight for hpo - needs ({min_low}, {min_high})')
 
         # straight-through, preserve restoring gradient
         clamped = log_ratios.clamp(clamp_low, clamp_high)
         log_ratios = log_ratios + (clamped - log_ratios).detach()
 
-    eps = torch.where(advantages >= 0., eps_clip_high, eps_clip_low)
+    is_pos = advantages >= 0.
+    eps = torch.where(is_pos, eps_clip_high, eps_clip_low)
+    scale = torch.where(is_pos, target_scale_high, target_scale_low)
+    sign = torch.where(is_pos, 1., -1.)
 
-    # fixed target
-    advantage_clip_low, advantage_clip_high = cast_tuple(advantage_clip, 2)
-    target = eps * advantages.clamp(-advantage_clip_low, advantage_clip_high)
+    # mollified sign target - exact on-policy gradient A, smooth ramp to zero at target, bounded restore beyond
+    target = scale * eps * sign
     weight = advantages.abs()
 
     # huber - smooth gradient decay at the target, no clip cliff

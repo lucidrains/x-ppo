@@ -51,7 +51,7 @@ def actor_loss(
     old_log_probs,
     advantages,
     eps_clip,
-    advantage_clip = 1.,
+    target_scale = 1.25,
     per_action_dim = False
 ):
     if method == 'ppo':
@@ -68,7 +68,7 @@ def actor_loss(
         old_log_probs,
         advantages,
         eps_clip = eps_clip,
-        advantage_clip = advantage_clip,
+        target_scale = target_scale,
         per_action_dim = per_action_dim
     )
 
@@ -120,7 +120,7 @@ def train(
     gamma = 0.99,
     lam = 0.95,
     eps_clip = 0.2,
-    advantage_clip = 1.,
+    target_scale = 1.25,
     per_action_dim = False,
     rpo_alpha = 0.,
     value_coef = 0.5,
@@ -259,7 +259,7 @@ def train(
                     old_log_prob,
                     advantage,
                     eps_clip,
-                    advantage_clip = advantage_clip,
+                    target_scale = target_scale,
                     per_action_dim = per_action_dim
                 ).mean()
 
@@ -340,7 +340,7 @@ def train(
             'gamma': gamma,
             'lam': lam,
             'eps_clip': eps_clip,
-            'advantage_clip': advantage_clip,
+            'target_scale': target_scale,
             'per_action_dim': per_action_dim,
             'rpo_alpha': rpo_alpha,
             'value_coef': value_coef,
@@ -436,7 +436,7 @@ def run(
     epochs = 10,
     lr = 3e-4,
     eps = 0.2,
-    advantage_clip = 1.,
+    target_scale = 1.25,
     per_action_dim = False,
     rpo_alpha = 0.,
     grad_clip = 0.5,
@@ -471,7 +471,7 @@ def run(
                 epochs = epochs,
                 lr = lr,
                 eps_clip = eps,
-                advantage_clip = advantage_clip,
+                target_scale = target_scale,
                 per_action_dim = per_action_dim,
                 rpo_alpha = rpo_alpha,
                 grad_clip = grad_clip,

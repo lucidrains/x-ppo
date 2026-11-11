@@ -22,6 +22,7 @@ from x_ppo import (
     spo_actor_loss,
     hpo_actor_loss,
     calc_gae,
+    calc_smdp_gae,
     calc_returns,
     combine_grouped_advantages,
     dones_to_masks,
@@ -150,21 +151,21 @@ def grad_magnitude(loss_fn, log_ratios, advantages):
     return torch.autograd.grad(loss, x)[0].abs()
 
 def test_hpo():
-    # quadratic gate below 1 sigma, linear above at init
+    # exact unbiased policy gradient -A at init (log_ratio = 0) for all advantages
 
     advantages = torch.tensor([0.2, -0.4, 3., -3.])
     log_probs = torch.zeros(4, requires_grad = True)
 
     hpo_actor_loss(log_probs, torch.zeros(4), advantages, eps_clip = 0.2).sum().backward()
 
-    assert torch.allclose(log_probs.grad, -advantages * advantages.abs().clamp(max = 1.))
+    assert torch.allclose(log_probs.grad, -advantages)
 
-    # fixed target inside trust band, linear restore outside
+    # constant gradient on inner core, mollified linear ramp inside [target - eps, target], linear restore outside
 
-    log_ratios = torch.tensor([0.12, -0.12, 0.5, -0.5], requires_grad = True)
-    hpo_actor_loss(log_ratios, torch.zeros(4), torch.tensor([0.3, -0.3, 0.3, -0.3]), eps_clip = 0.2).sum().backward()
+    log_ratios = torch.tensor([0.04, 0.15, 0.5, -0.5], requires_grad = True)
+    hpo_actor_loss(log_ratios, torch.zeros(4), torch.tensor([0.3, 0.3, 0.3, -0.3]), eps_clip = 0.2, target_scale = 1.25).sum().backward()
 
-    assert torch.allclose(log_ratios.grad, torch.tensor([0.09, -0.09, 0.3, -0.3]))
+    assert torch.allclose(log_ratios.grad, torch.tensor([-0.3, -0.15, 0.3, -0.3]))
 
     advantages = torch.tensor([10., -10.])
     log_probs = torch.tensor([-5., 5.], requires_grad = True)
@@ -176,7 +177,7 @@ def test_hpo():
     # asymmetric clip and Huber transition
 
     eps_low, eps_high = 0.2, 0.28
-    log_ratios = torch.tensor([2 * eps_high, -2 * eps_low], requires_grad = True)
+    log_ratios = torch.tensor([2.5 * eps_high, -2.5 * eps_low], requires_grad = True)
 
     hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1., -1.]), eps_clip = (eps_low, eps_high)).sum().backward()
 
@@ -185,12 +186,13 @@ def test_hpo():
     # gradient decays smoothly to the target, PPO clips
 
     eps = 0.2
+    target = 1.25 * eps
     distances = torch.tensor([0., 0.05, 0.1, 0.15, 0.2, 0.5, 1.])
-    log_ratios = eps - distances
+    log_ratios = target - distances
     ones = torch.ones_like(log_ratios)
 
-    hpo = grad_magnitude(partial(hpo_actor_loss, eps_clip = eps, min_advantage_std = None), log_ratios, ones)
-    ppo = grad_magnitude(partial(ppo_actor_loss, eps_clip = eps), log_ratios, ones)
+    hpo = grad_magnitude(partial(hpo_actor_loss, eps_clip = eps, target_scale = 1.25, min_advantage_std = None), log_ratios, ones)
+    ppo = grad_magnitude(partial(ppo_actor_loss, eps_clip = eps), eps - distances, ones)
 
     assert hpo[0] < 1e-6 and torch.all(hpo[1:] >= hpo[:-1] - 1e-6) and torch.allclose(hpo[4], torch.ones(()))
     assert ppo[0] < 1e-6 and ppo[1] > 1. and ppo[1] > ppo[4]
@@ -200,19 +202,22 @@ def test_hpo():
     with pytest.raises(ValueError):
         hpo_actor_loss(torch.zeros(1), torch.zeros(1), torch.ones(1), log_ratio_clamp = (-0.2, 0.2))
 
+    with pytest.raises(ValueError):
+        hpo_actor_loss(torch.zeros(1), torch.zeros(1), torch.ones(1), target_scale = 0.5)
+
     log_probs = torch.tensor([5., -5.], requires_grad = True)
 
     hpo_actor_loss(log_probs, torch.zeros(2), torch.tensor([1., -1.]), log_ratio_clamp = (-1., 1.)).sum().backward()
 
     assert torch.allclose(log_probs.grad, torch.tensor([1., -1.]))
 
-    # advantage_clip saturates the target, asymmetric low / high
+    # target_scale supports asymmetric low / high
 
-    log_ratios = torch.tensor([0.25, -0.25], requires_grad = True)
+    log_ratios = torch.tensor([0.2, -0.3], requires_grad = True)
 
-    hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1.5, -1.5]), eps_clip = 0.2, advantage_clip = (1., 2.)).sum().backward()
+    hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1.5, -1.5]), eps_clip = 0.2, target_scale = (2., 1.)).sum().backward()
 
-    assert torch.allclose(log_ratios.grad, torch.full((2,), -0.375))
+    assert torch.allclose(log_ratios.grad, torch.tensor([0., 0.75]))
 
     # zero variance advantages are skipped by default
 
@@ -2015,21 +2020,22 @@ def test_spo_per_action_dim_matches_reference(asymmetric):
 def test_hpo_per_action_dim_matches_reference():
     action_log_probs, old_action_log_probs, advantages = per_action_dim_inputs()
     eps_low, eps_high = 0.2, 0.3
-    advantage_clip = 2.
+    target_scale = 1.5
 
     loss = hpo_actor_loss(
         action_log_probs,
         old_action_log_probs,
         advantages,
         eps_clip = (eps_low, eps_high),
-        advantage_clip = advantage_clip,
+        target_scale = target_scale,
         per_action_dim = True
     )
 
     adv = advantages[..., None]
-    eps = torch.where(adv >= 0., eps_high, eps_low)
+    is_pos = adv >= 0.
+    eps = torch.where(is_pos, eps_high, eps_low)
 
-    target = eps * adv.clamp(-advantage_clip, advantage_clip)
+    target = target_scale * eps * torch.where(is_pos, 1., -1.)
     error = action_log_probs - target
     abs_error = error.abs()
     huber = torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)
@@ -2053,9 +2059,9 @@ def test_hpo_per_action_dim_matches_reference_gradient():
         per_action_dim = True
     ).sum().backward()
 
-    # preserves 1-sigma huber gate (quadratic below 1, linear above) and divides gradient across dims
+    # preserves exact unbiased policy gradient -A at init and divides gradient across dims
 
-    expected = -(advantages * advantages.abs().clamp(max = 1.)).div(log_probs.shape[-1])
+    expected = -advantages.div(log_probs.shape[-1])
 
     assert torch.allclose(log_probs.grad, expected[..., None])
 
@@ -2694,5 +2700,102 @@ def test_gae_multi_temporal_hierarchy_usage_example():
         loss = hpo_actor_loss(log_probs, old_log_probs, level_gae.advantages).mean()
         loss.backward()
         assert log_probs.grad is not None
+
+# semi-markov gae tests (variable option durations)
+
+@param('trace_power', (0., 0.5, 1.))
+def test_smdp_gae_matches_primitive_expanded(trace_power):
+    torch.manual_seed(0)
+    gamma, lam = 0.99, 0.95
+
+    taus = tensor([1, 2, 3, 4, 6, 8])[torch.randint(0, 6, (24,))]
+    total_prim = int(taus.sum())
+
+    prim_rewards = 0.5 * torch.randn(total_prim)
+    values = torch.randn(24)
+    next_values = cat((values[1:], torch.randn(1)))
+    terminated = torch.rand(24) < 0.12
+    truncated = (~terminated) & (torch.rand(24) < 0.10)
+    next_values = torch.where(terminated | truncated, torch.randn(24), next_values)
+
+    starts = taus.cumsum(0) - taus
+    opt_idx = torch.repeat_interleave(torch.arange(24), taus)
+    within_step = torch.arange(total_prim) - starts[opt_idx]
+    rewards_gamma = torch.zeros(24).scatter_add_(0, opt_idx, (gamma ** within_step.float()) * prim_rewards)
+
+    smdp_gae = calc_smdp_gae(
+        rewards_gamma,
+        values,
+        durations = taus.float(),
+        next_values = next_values,
+        terminated = terminated,
+        truncated = truncated,
+        gamma = gamma,
+        lam = lam,
+        trace_power = trace_power,
+        use_accelerated = False
+    )
+
+    is_last = within_step == (taus[opt_idx] - 1)
+    exp_values = values[opt_idx]
+    bound_lam = lam ** (taus[opt_idx].float() ** trace_power)
+
+    exp_gae = calc_gae(
+        rewards = prim_rewards,
+        values = exp_values,
+        next_values = torch.where(is_last, next_values[opt_idx], exp_values),
+        terminated = is_last & terminated[opt_idx],
+        truncated = is_last & truncated[opt_idx],
+        gamma = gamma,
+        lam = torch.where(is_last, bound_lam, 1.),
+        use_accelerated = False,
+        return_advantages = True
+    )
+
+    assert torch.allclose(smdp_gae.advantages, exp_gae.advantages[starts], atol = 1e-5)
+    assert torch.allclose(smdp_gae.returns, exp_gae.returns[starts], atol = 1e-5)
+
+    # decision-space PPO gradient matches 1 / tau_k weighted primitive-expanded PPO gradient
+
+    states, actions = torch.randn(24, 8), torch.randint(0, 16, (24,))
+    actor_smdp = nn.Linear(8, 16)
+    actor_exp = copy.deepcopy(actor_smdp)
+
+    old_lp = Categorical(logits = actor_smdp(states)).log_prob(actions).detach()
+    adv = z_score(smdp_gae.advantages)
+
+    ppo_actor_loss(Categorical(logits = actor_smdp(states)).log_prob(actions), old_lp, adv).mean().backward()
+
+    weights = (1. / taus.float())[opt_idx]
+    per_step = ppo_actor_loss(Categorical(logits = actor_exp(states[opt_idx])).log_prob(actions[opt_idx]), old_lp[opt_idx], adv[opt_idx])
+    ((per_step * weights).sum() / weights.sum()).backward()
+
+    assert torch.allclose(actor_smdp.weight.grad, actor_exp.weight.grad, atol = 1e-6)
+
+def test_smdp_gae_shapes_and_edge_cases():
+    # grouped multi-critic + variable lens with NaN padding in durations + finite_time
+
+    b, g, n = 3, 2, 6
+    rewards = torch.randn(b, g, n)
+    values = torch.randn(b, g, n)
+    durations = torch.randint(1, 5, (b, n)).float()
+    durations[0, 3:] = float('nan')
+    lens = tensor([3, 6, 4])
+
+    out = calc_smdp_gae(
+        rewards, values, durations,
+        lens = lens, group_dim = 1, trace_power = 0.5,
+        finite_time = True, use_accelerated = False
+    )
+
+    assert out.returns.shape == (b, g, n)
+    assert out.advantages.shape == (b, g, n)
+    assert torch.isfinite(out.returns).all()
+    assert torch.isfinite(out.advantages).all()
+    assert torch.all(out.advantages[0, :, 3:] == 0.)
+
+    with pytest.raises(ValueError):
+        calc_gae(torch.randn(2, 8), torch.randn(2, 8), durations = torch.ones(2, 8), chunk_size = 2)
+
 
 

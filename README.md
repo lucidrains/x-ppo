@@ -141,6 +141,22 @@ gae = calc_gae(rewards, values, terminated = terminated, truncated = truncated, 
 
 The `finite_time` option follows *Finite-Time Generalized Advantage Estimation*.
 
+For variable-duration options / action chunks (Semi-Markov GAE), pass `durations` ($\tau_k \ge 1$) and `trace_power` ($\alpha \in [0, 1]$, decaying boundary $\lambda$ as $\lambda^{\tau_k^\alpha}$: `1.` for physical clock trace, `0.` for per-decision trace):
+
+```python
+from x_ppo import calc_smdp_gae
+
+gae = calc_smdp_gae(
+    rewards,                                    # (b n) within-option sum_{j=0}^{tau-1} gamma^j r_{t+j}
+    values,                                     # (b n) V(S_k)
+    durations,                                  # (b n) elapsed primitive steps tau_k
+    next_values = next_values,                  # (b n) V(S_{k+1})
+    terminated = terminated,
+    truncated = truncated,
+    trace_power = 1.
+)
+```
+
 ### multi-critic
 
 One value network per reward group, each group's advantages normalized separately before combination - Mysore et al., Vijayan et al.
