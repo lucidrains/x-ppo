@@ -3017,6 +3017,61 @@ def test_smdp_rate_advantage_resolves_multi_horizon_paradox():
     smdp_neg = critic.filter_actions(z, neg_cands, rate_advantage = True)
     assert smdp_neg.actions.item() == 2
 
+def test_smdp_q_critic_continuous_packed_horizons():
+    torch.manual_seed(0)
 
+    batch, seq, num_cands, dim_embed, max_latent_dim = 3, 5, 4, 8, 6
+    horizons = tensor([1., 2., 4., 8.])
+    packed_dim = 1 + max_latent_dim
 
+    critic = NextLatentQCritic(
+        nn.Linear(dim_embed, 1),
+        dim_embed = dim_embed,
+        dim_action = packed_dim,
+        action_embed_dim = 16,
+        action_horizons = horizons,
+        discrete_actions = False,
+        hidden_dim = 32,
+        depth = 2,
+        gamma = 0.99
+    )
 
+    embeddings = torch.randn(batch, seq, dim_embed)
+    next_embeddings = torch.randn(batch, seq, dim_embed)
+    h_idx = torch.randint(0, horizons.numel(), (batch, seq))
+    z_pad = torch.randn(batch, seq, max_latent_dim).tanh()
+    packed_actions = cat((h_idx.float()[..., None], z_pad), dim = -1)
+
+    nom_durs = horizons[h_idx]
+    terminated = torch.rand(batch, seq) < 0.2
+    durations = torch.where(terminated, torch.ones_like(nom_durs), nom_durs)
+    rewards = 0.2 * torch.randn(batch, seq)
+    returns = torch.randn(batch, seq)
+
+    loss, out = critic(
+        embeddings,
+        packed_actions,
+        rewards = rewards,
+        next_embeddings = next_embeddings,
+        returns = returns,
+        dones = terminated,
+        durations = durations,
+        return_loss_breakdown = True
+    )
+
+    assert torch.isfinite(loss)
+    assert out.duration is not None and torch.isfinite(out.duration)
+
+    pred_durs = critic.predicted_durations(embeddings, packed_actions)
+    assert pred_durs.shape == (batch, seq)
+    assert ((pred_durs >= 1. - 1e-5) & (pred_durs <= nom_durs + 1e-5)).all()
+
+    cand_h = torch.randint(0, horizons.numel(), (batch, seq, num_cands))
+    cand_z = torch.randn(batch, seq, num_cands, max_latent_dim).tanh()
+    cand_packed = cat((cand_h.float()[..., None], cand_z), dim = -1)
+
+    scores = critic.smdp_advantage_scores(embeddings, cand_packed, conservative_weight = 0.25)
+    assert scores.shape == (batch, seq, num_cands)
+
+    filtered = critic.filter_actions(embeddings[:, 0], cand_packed[:, 0], conservative_weight = 0.25)
+    assert filtered.actions.shape == (batch, packed_dim)

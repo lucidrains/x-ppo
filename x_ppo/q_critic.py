@@ -202,6 +202,10 @@ class NextLatentQCritic(Module):
         denom = -torch.expm1(log_g)
         return torch.where((1. - gamma).abs() < 1e-6, durs, -torch.expm1(durs * log_g) / denom.clamp_min(1e-12))
 
+    def _nominal_horizons(self, actions: Tensor, dtype: torch.dtype) -> Tensor:
+        horizon_idx = actions.long() if self.discrete_actions else actions[..., 0].long()
+        return self.action_horizons[horizon_idx].to(dtype = dtype)
+
     def forward_value(self, embeddings: Tensor) -> Tensor:
         values = self.value_net(embeddings)
 
@@ -240,7 +244,7 @@ class NextLatentQCritic(Module):
 
         pred_durations = None
         if exists(self.to_duration) and exists(self.action_horizons):
-            nom_h = self.action_horizons[actions.long()].to(dtype = embeddings.dtype)
+            nom_h = self._nominal_horizons(actions, embeddings.dtype)
             pred_durations = 1. + (nom_h - 1.) * self.to_duration(hidden)[..., 0].sigmoid()
 
         return QHeads(
@@ -414,7 +418,7 @@ class NextLatentQCritic(Module):
                 )
 
             if exists(durations) and exists(heads.pred_durations) and exists(self.action_horizons):
-                nom_h = self.action_horizons[actions.long()].to(dtype = dtype).clamp_min(1.)
+                nom_h = self._nominal_horizons(actions, dtype).clamp_min(1.)
                 duration_loss = masked_mean(
                     F.smooth_l1_loss(
                         heads.pred_durations / nom_h,
