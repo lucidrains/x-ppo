@@ -319,6 +319,66 @@ def test_finite_time_gae():
         assert torch.allclose(out.returns, expected + values, atol = 1e-5)
         assert torch.allclose(out.advantages, expected, atol = 1e-5)
 
+def test_smdp_finite_time_gae_telescoping():
+    torch.manual_seed(0)
+
+    b, t = 2, 6
+    rewards = torch.randn(b, t)
+    values = torch.randn(b, t)
+    durations = torch.tensor([
+        [3., 1., 4., 2., 1., 3.],
+        [2., 5., 1., 3., 2., 1.]
+    ])
+    terminated = torch.tensor([
+        [False, False, True, False, False, False],
+        [False, True, False, False, False, True]
+    ])
+    truncated = torch.tensor([
+        [False, False, False, False, False, True],
+        [False, False, False, False, False, False]
+    ])
+    next_values = torch.randn(b, t)
+    gamma = 0.99
+
+    masks = (~terminated).float()
+    done_masks = (~(terminated | truncated)).float()
+    deltas = rewards + (gamma ** durations) * next_values * masks - values
+
+    for trace_power in (0., 0.5, 1.):
+        d_step = torch.ones_like(durations) if trace_power == 0. else durations.pow(trace_power)
+
+        horizons = torch.zeros_like(durations)
+        h = torch.zeros(b)
+        for step in reversed(range(t)):
+            h = d_step[:, step] + done_masks[:, step] * h
+            horizons[:, step] = h
+
+        for lam in (0., 0.95, 1., 1.1):
+            rem = horizons - d_step
+            if lam == 1.:
+                ratios = rem / horizons
+            elif lam == 0.:
+                ratios = (rem > 0.).float()
+            else:
+                ratios = (1. - lam ** rem) / (1. - lam ** horizons)
+
+            expected = torch.zeros_like(rewards)
+            advantage = torch.zeros(b)
+            for step in reversed(range(t)):
+                gate = (gamma ** durations[:, step]) * (lam ** d_step[:, step]) * done_masks[:, step] * ratios[:, step]
+                advantage = deltas[:, step] + gate * advantage
+                expected[:, step] = advantage
+
+            out = calc_smdp_gae(
+                rewards, values, durations,
+                terminated = terminated, truncated = truncated,
+                next_values = next_values, gamma = gamma, lam = lam,
+                trace_power = trace_power, finite_time = True, use_accelerated = False
+            )
+
+            assert torch.allclose(out.returns, expected + values, atol = 1e-5)
+            assert torch.allclose(out.advantages, expected, atol = 1e-5)
+
 # Shapes: 1D, 2D, 3D
 
 @param('shape', [(8,), (2, 8), (2, 3, 8)])

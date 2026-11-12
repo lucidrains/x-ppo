@@ -175,21 +175,23 @@ def reverse_assoc_scan(
 # finite-time gae - renormalize geometric weights over the remaining rollout
 
 def finite_time_gae_ratio(
-    horizon: Tensor,                          # (* n) remaining steps in segment
-    lam: float | Tensor                       # () or (b)
+    horizon: Tensor,                          # (* n) remaining trace in segment
+    lam: float | Tensor,                      # () or (b)
+    step: float | Tensor = 1.                 # () or (* n) per-step trace increment
 ) -> Tensor:
-    # (1 - lam ** (h - 1)) / (1 - lam ** h), stable near lam = 1
-    # gates already carry gamma * lam, so only the ratio is returned
+    # (1 - lam ** (h - step)) / (1 - lam ** h), stable near lam = 1 and overflow-free for lam > 1
+    # gates already carry gamma * lam ** step, so only the ratio is returned
 
     lam = as_tensor(lam, device = horizon.device, dtype = horizon.dtype)
+    rem = horizon - step
 
-    log_lam = lam.clamp(min = torch.finfo(lam.dtype).tiny).log()
-    log_lam = torch.where(lam < 1., log_lam, torch.where(lam > 1., -log_lam, -torch.ones_like(lam)))
+    neg_abs_log_lam = -lam.clamp(min = torch.finfo(lam.dtype).tiny).log().abs()
+    neg_abs_log_lam = torch.where(lam == 1., -torch.ones_like(lam), neg_abs_log_lam)
 
-    ratio = torch.expm1((horizon - 1.) * log_lam) / torch.expm1(horizon * log_lam)
-    ratio = ratio / lam.clamp(min = 1.)
+    ratio = torch.expm1(rem * neg_abs_log_lam) / torch.expm1(horizon * neg_abs_log_lam)
+    ratio = ratio / lam.clamp(min = 1.).pow(step)
 
-    return torch.where(lam == 1., (horizon - 1.) / horizon, ratio)
+    return torch.where(lam == 1., rem / horizon, ratio)
 
 # generalized advantage estimation - Schulman et al.
 
@@ -365,6 +367,9 @@ def calc_gae(
 
     # semi-markov option durations: discount by gamma^tau and decay trace by lam^(tau ^ trace_power)
 
+    base_lam = pad_right_ndim_to(as_tensor(lam, device = device, dtype = dtype), rewards.ndim)
+    trace_step = 1.
+
     if exists(durations):
         durations = durations.to(dtype = dtype)
         if exists(len_mask):
@@ -373,8 +378,8 @@ def calc_gae(
         gamma = pad_right_ndim_to(as_tensor(gamma, device = device, dtype = dtype), durations.ndim) ** durations
 
         if trace_power != 0.:
-            eff_dur = durations if trace_power == 1. else durations.pow(trace_power)
-            lam = pad_right_ndim_to(as_tensor(lam, device = device, dtype = dtype), durations.ndim) ** eff_dur
+            trace_step = durations if trace_power == 1. else durations.pow(trace_power)
+            lam = base_lam ** trace_step
 
     # discount factors and lambdas may differ across the batch
 
@@ -389,7 +394,6 @@ def calc_gae(
 
     if chunk_size > 1:
         trim = num_chunks * chunk_size
-        done_mask_steps = as_tensor(done_masks, device = device, dtype = dtype).expand_as(delta)
         step_discounts = as_tensor(gamma * done_masks, device = device, dtype = dtype).expand_as(delta)
 
         delta_chunks, step_discounts = tuple(
@@ -401,9 +405,6 @@ def calc_gae(
         gates = as_tensor(lam * step_discounts.prod(dim = -1), device = device, dtype = dtype).expand_as(delta)
         values = values[..., 0:trim:chunk_size]
 
-        if finite_time:
-            continuation = rearrange(done_mask_steps[..., :trim], '... (c k) -> ... c k', k = chunk_size).prod(dim = -1)
-
         if is_tensor(done_masks):
             done_masks = rearrange(done_masks[..., :trim], '... (c k) -> ... c k', k = chunk_size).prod(dim = -1)
 
@@ -412,14 +413,15 @@ def calc_gae(
     else:
         gates = as_tensor(gamma * lam * done_masks, device = device, dtype = dtype).expand_as(delta)
 
-        if finite_time:
-            continuation = as_tensor(done_masks, device = device, dtype = dtype).expand_as(delta)
-
-    # finite-time gae: count remaining steps per segment, then renormalize the geometric tail
+    # finite-time gae: count remaining trace per segment, then renormalize the geometric tail
 
     if finite_time:
-        horizon = reverse_assoc_scan(continuation, torch.ones_like(delta), use_accelerated)
-        gates = gates * finite_time_gae_ratio(horizon, lam)
+        continuation = as_tensor(done_masks, device = device, dtype = dtype)
+        step_inc = as_tensor(trace_step, device = device, dtype = dtype)
+        scan_shape = torch.broadcast_shapes(continuation.shape, step_inc.shape, (1,) * (delta.ndim - 1) + (delta.shape[-1],))
+
+        horizon = reverse_assoc_scan(continuation.expand(scan_shape), step_inc.expand(scan_shape), use_accelerated)
+        gates = gates * finite_time_gae_ratio(horizon, base_lam, step = step_inc)
 
     # scan
 
