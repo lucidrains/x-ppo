@@ -139,7 +139,7 @@ For gymnasium environments, pass `terminated` and `truncated` directly and let `
 gae = calc_gae(rewards, values, terminated = terminated, truncated = truncated, return_advantages = True)
 ```
 
-The `finite_time` option follows *Finite-Time Generalized Advantage Estimation*.
+`calc_gae` uses the finite-time correction from *Finite-Time Generalized Advantage Estimation* by default. Pass `finite_time = False` for classic GAE.
 
 For variable-duration options / action chunks (Semi-Markov GAE), pass `durations` ($\tau_k \ge 1$) and `trace_power` ($\alpha \in [0, 1]$, decaying boundary $\lambda$ as $\lambda^{\tau_k^\alpha}$: `1.` for physical clock trace, `0.` for per-decision trace):
 

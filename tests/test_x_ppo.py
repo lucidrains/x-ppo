@@ -269,7 +269,7 @@ def test_gae_matches_sequential():
 
     expected_returns, expected_advantages = sequential_gae(rewards, values, masks, gamma, lam)
 
-    out = calc_gae(rewards, values, masks, gamma = gamma, lam = lam, use_accelerated = False, return_advantages = True)
+    out = calc_gae(rewards, values, masks, gamma = gamma, lam = lam, finite_time = False, use_accelerated = False, return_advantages = True)
 
     assert torch.allclose(out.returns, expected_returns, atol = 1e-5)
     assert torch.allclose(out.advantages, expected_advantages, atol = 1e-5)
@@ -318,6 +318,21 @@ def test_finite_time_gae():
 
         assert torch.allclose(out.returns, expected + values, atol = 1e-5)
         assert torch.allclose(out.advantages, expected, atol = 1e-5)
+
+    # finite-time is the default
+
+    default_out = calc_gae(
+        rewards, values, masks,
+        gamma = gamma, lam = 0.95, next_value = next_val,
+        use_accelerated = False, return_advantages = True
+    )
+    explicit_out = calc_gae(
+        rewards, values, masks,
+        gamma = gamma, lam = 0.95, next_value = next_val,
+        finite_time = True, use_accelerated = False, return_advantages = True
+    )
+    assert torch.allclose(default_out.returns, explicit_out.returns)
+    assert torch.allclose(default_out.advantages, explicit_out.advantages)
 
 def test_smdp_finite_time_gae_telescoping():
     torch.manual_seed(0)
@@ -643,7 +658,7 @@ def test_calc_returns():
     returns = calc_returns(rewards, gamma = gamma, use_accelerated = False)
     assert torch.allclose(returns, expected, atol = 1e-5)
 
-    returns_gae = calc_gae(rewards, values = torch.zeros_like(rewards), gamma = gamma, lam = 1.0, use_accelerated = False)
+    returns_gae = calc_gae(rewards, values = torch.zeros_like(rewards), gamma = gamma, lam = 1.0, finite_time = False, use_accelerated = False)
     assert torch.allclose(returns_gae, expected, atol = 1e-5)
 
 def test_calc_returns_with_next_value():
@@ -781,19 +796,19 @@ def test_gae_variable_lengths_explicit_bootstrap():
 
     # next_value is the bootstrap at the last valid timestep
 
-    out = calc_gae(rewards, values, lens = lens, gamma = gamma, lam = 1.0, next_value = 10., use_accelerated = False, return_advantages = True)
+    out = calc_gae(rewards, values, lens = lens, gamma = gamma, lam = 1.0, next_value = 10., finite_time = False, use_accelerated = False, return_advantages = True)
     assert torch.allclose(out.returns, torch.tensor([[10.9, 11.0, 0., 0.]]), atol = 1e-5)
 
     # explicit next values are respected at the last valid timestep
 
     next_values = torch.tensor([[0., 10., 0., 0.]])
-    out = calc_gae(rewards, values, lens = lens, gamma = gamma, lam = 1.0, next_values = next_values, use_accelerated = False, return_advantages = True)
+    out = calc_gae(rewards, values, lens = lens, gamma = gamma, lam = 1.0, next_values = next_values, finite_time = False, use_accelerated = False, return_advantages = True)
     assert torch.allclose(out.returns, torch.tensor([[10.9, 11.0, 0., 0.]]), atol = 1e-5)
 
     # but a terminated last timestep should still not bootstrap
 
     masks = torch.tensor([[1., 0., 1., 1.]])
-    out = calc_gae(rewards, values, masks = masks, lens = lens, gamma = gamma, lam = 1.0, next_values = next_values, use_accelerated = False, return_advantages = True)
+    out = calc_gae(rewards, values, masks = masks, lens = lens, gamma = gamma, lam = 1.0, next_values = next_values, finite_time = False, use_accelerated = False, return_advantages = True)
     assert torch.allclose(out.returns, torch.tensor([[2.8, 2.0, 0., 0.]]), atol = 1e-5)
 
 def test_gae_variable_lengths_nan_padding_does_not_leak():
@@ -825,7 +840,7 @@ def test_calc_returns_variable_lengths_next_value():
 
     expected = calc_gae(
         rewards, torch.zeros_like(rewards), masks = masks, gamma = 0.99, lam = 1.0,
-        next_value = next_value, lens = lens, use_accelerated = False
+        next_value = next_value, lens = lens, finite_time = False, use_accelerated = False
     )
 
     assert torch.allclose(returns, expected, atol = 1e-5)
@@ -2793,6 +2808,7 @@ def test_smdp_gae_matches_primitive_expanded(trace_power):
         gamma = gamma,
         lam = lam,
         trace_power = trace_power,
+        finite_time = False,
         use_accelerated = False
     )
 
@@ -2808,6 +2824,7 @@ def test_smdp_gae_matches_primitive_expanded(trace_power):
         truncated = is_last & truncated[opt_idx],
         gamma = gamma,
         lam = torch.where(is_last, bound_lam, 1.),
+        finite_time = False,
         use_accelerated = False,
         return_advantages = True
     )

@@ -401,7 +401,7 @@ class PPO(Module):
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
-        finite_time_gae = False,
+        finite_time_gae = True,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -633,7 +633,7 @@ def main(
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
-    finite_time_gae = False,
+    finite_time_gae = True,
     eps_clip = 0.2,
     beta_s = .01,
     regen_reg_rate = 1e-4,

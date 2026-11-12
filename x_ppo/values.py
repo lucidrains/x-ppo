@@ -216,7 +216,7 @@ def calc_gae(
     chunk_size: int | tuple[int, ...] | list[int] = 1,
     durations: Tensor | None = None,          # (b n) semi-markov option durations tau_k >= 1
     trace_power: float = 1.,                  # 1.: lam^tau clock trace; 0.: lam^1 decision trace; (0, 1): interpolated
-    finite_time: bool = False                 # normalize geometric weights over the remaining rollout
+    finite_time: bool = True                  # normalize geometric weights over the remaining rollout
 ) -> Tensor | GAE | tuple[Tensor | GAE, ...]:
     if exists(durations) and (isinstance(chunk_size, (tuple, list)) or chunk_size > 1):
         raise ValueError('`durations` (semi-markov gae) cannot be combined with `chunk_size` > 1')
