@@ -443,18 +443,6 @@ Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(los
 ```
 
 ```bibtex
-@misc{shin2026adaptiveactionchunkingmultichunk,
-    title   = {Adaptive Action Chunking via Multi-Chunk Q Value Estimation},
-    author  = {Yongjae Shin and Jongseong Chae and Seongmin Kim and Jongeui Park and Youngchul Sung},
-    year    = {2026},
-    eprint  = {2605.10044},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2605.10044},
-}
-```
-
-```bibtex
 @inproceedings{ye2020mastering,
     title   = {Mastering Complex Control in MOBA Games with Deep Reinforcement Learning},
     author  = {Deheng Ye and Zhao Liu and Mingfei Sun and Bei Shi and Peilin Zhao and Hao Wu and Hongsheng Yu and Shaojie Yang and Xipeng Wu and Qingwei Guo and Qiaobo Chen and Yinyuting Yin and Hao Zhang and Tengfei Shi and Liang Wang and Qiang Fu and Wei Yang and Lanxiao Huang},
@@ -565,5 +553,52 @@ Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(los
     journal = {arXiv preprint arXiv:2507.18071},
     year    = {2025},
     url     = {https://arxiv.org/abs/2507.18071}
+}
+```
+
+```bibtex
+@article{Park2025FlowQ,
+    title   = {Flow Q-Learning},
+    author  = {Seohong Park and Qiyang Li and Sergey Levine},
+    journal = {ArXiv},
+    year    = {2025},
+    volume  = {abs/2502.02538},
+    url     = {https://arxiv.org/abs/2502.02538}
+}
+```
+
+```bibtex
+@misc{gladstone2026explorativemodelingunlockingpretraining,
+    title   = {Explorative Modeling: Unlocking a Third Pretraining Axis and End-to-End Generation},
+    author  = {Alexi Gladstone and Heng Ji and Yilun Du},
+    year    = {2026},
+    eprint  = {2607.27372},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.27372},
+}
+```
+
+```bibtex
+@misc{wagenmaker2025steeringdiffusionpolicy,
+    title   = {Steering Your Diffusion Policy with Latent Space Reinforcement Learning},
+    author  = {Andrew Wagenmaker and Mitsuhiko Nakamoto and Yunchu Zhang and Seohong Park and Waleed Yagoub and Anusha Nagabandi and Abhishek Gupta and Sergey Levine},
+    year    = {2025},
+    eprint  = {2506.15799},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2506.15799},
+}
+```
+
+```bibtex
+@misc{shin2026adaptiveactionchunkingmultichunk,
+    title   = {Adaptive Action Chunking via Multi-Chunk Q Value Estimation},
+    author  = {Yongjae Shin and Jongseong Chae and Seongmin Kim and Jongeui Park and Youngchul Sung},
+    year    = {2026},
+    eprint  = {2605.10044},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.10044},
 }
 ```
