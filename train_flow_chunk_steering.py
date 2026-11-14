@@ -6,9 +6,10 @@
 #   "ema-pytorch>=0.5.2",
 #   "fire",
 #   "gymnasium[box2d]>=1.0.0",
+#   "imageio[ffmpeg]",
 #   "mean-conc-beta>=0.2.7",
-#   "moviepy",
 #   "numpy",
+#   "pillow",
 #   "torch>=2.5",
 #   "torch-einops-utils>=0.2.5",
 #   "x-transformers>=2.3.21",
@@ -30,15 +31,17 @@ import random
 import time
 from copy import deepcopy
 from pathlib import Path
-from shutil import rmtree
 
 import fire
+import numpy as np
+import imageio.v2 as imageio
+from PIL import Image, ImageDraw, ImageFont
+
 import gymnasium as gym
 from gymnasium.vector import AutoresetMode, SyncVectorEnv
-import numpy as np
 
 import torch
-from torch import Tensor, arange, cat, nn, stack
+from torch import nn, Tensor, arange, cat, stack
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.nn import LayerNorm, Linear, Module, RMSNorm, Sequential, SiLU
@@ -46,6 +49,7 @@ from torch.nn.utils import clip_grad_norm_
 
 import einx
 from einops import rearrange, repeat
+
 from ema_pytorch import EMA
 from mean_conc_beta import Beta as MeanConcBeta
 from torch_einops_utils import lens_to_mask, mask_after, masked_mean, pack_with_inverse
@@ -55,7 +59,10 @@ from x_ppo import calc_gae, clipped_value_loss_fn, hpo_actor_loss, ppo_actor_los
 
 # constants
 
+torch.set_num_threads(2)
+
 ppo_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
 flow_device = torch.device(
     'cuda:0' if torch.cuda.is_available()
     else ('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -63,6 +70,8 @@ flow_device = torch.device(
 
 BETA_ENTROPY_SCHEDULE = (0.0016, 0.0008, 0.0004, 0.0002, 0.0001, 0.00004)
 LR_SCALE_SCHEDULE = (1., 0.85, 0.55, 0.30, 0.15, 0.08)
+
+DT_BAND_RGB = ((72, 149, 239), (42, 157, 143), (244, 162, 97), (230, 57, 70))
 
 # helpers
 
@@ -82,32 +91,42 @@ def schedule_at(schedule, progress):
     idx = min(int(progress * len(schedule)), len(schedule) - 1)
     return schedule[max(0, idx)]
 
+def dt_color_rgb(dt, max_chunk_size = 16):
+    band = min(3, max(0, int((dt - 1) * 4 // max(1, max_chunk_size))))
+    return DT_BAND_RGB[band]
+
 def update_network_(loss, optimizer, max_grad_norm = None):
     optimizer.zero_grad()
     loss.backward()
+
     if exists(max_grad_norm):
         params = [p for group in optimizer.param_groups for p in group['params']]
         clip_grad_norm_(params, max_grad_norm)
+
     optimizer.step()
 
 def true_next_obs(next_obs, done, info):
     if not done.any() or 'final_obs' not in info:
         return next_obs
+
     out = next_obs.copy()
+
     for i in np.flatnonzero(done):
         if exists(info['final_obs'][i]):
             out[i] = info['final_obs'][i]
+
     return out
 
 def make_orthonormal_dct(n):
-    # orthonormal DCT-II basis U in R^{n x n}: c ~ N(0, I) => U^T c ~ N(0, I)
-
     k = arange(n, dtype = torch.float32)[:, None]
     t = arange(n, dtype = torch.float32)[None, :]
+
     mat = torch.cos(math.pi / n * (t + 0.5) * k)
     mat[0] *= math.sqrt(1. / n)
+
     if n > 1:
         mat[1:] *= math.sqrt(2. / n)
+
     return mat
 
 def sample_pyoco_noise(batch, seq_len, dim, corr_alpha, device):
@@ -116,6 +135,7 @@ def sample_pyoco_noise(batch, seq_len, dim, corr_alpha, device):
 
     z_shared = torch.randn((batch, 1, dim), device = device)
     z_indep = torch.randn((batch, seq_len, dim), device = device)
+
     return corr_alpha * z_shared + math.sqrt(max(0., 1. - corr_alpha ** 2)) * z_indep
 
 def should_abort_chunk(est_total_q, planned_q, threshold = 0.25):
@@ -124,7 +144,13 @@ def should_abort_chunk(est_total_q, planned_q, threshold = 0.25):
 # rectified flow + explorative modeling (Gladstone et al.)
 
 class NanoFlow(Module):
-    def __init__(self, model: Module, times_cond_kwarg = 'times', data_shape = None, max_timesteps = 100):
+    def __init__(
+        self,
+        model: Module,
+        times_cond_kwarg = 'times',
+        data_shape = None,
+        max_timesteps = 100
+    ):
         super().__init__()
         self.model = model
         self.times_cond_kwarg = times_cond_kwarg
@@ -159,7 +185,15 @@ class NanoFlow(Module):
 
         return F.mse_loss(data - noise, pred_flow, reduction = loss_reduction)
 
-def xm_flow_loss(flow_model: NanoFlow, data: Tensor, *, mask: Tensor, candidates = 2, noise_fn = None, **cond_kwargs):
+def xm_flow_loss(
+    flow_model: NanoFlow,
+    data: Tensor,
+    *,
+    mask: Tensor,
+    candidates = 2,
+    noise_fn = None,
+    **cond_kwargs
+):
     b, dev = data.shape[0], data.device
     times = torch.rand(b, device = dev)
 
@@ -177,12 +211,24 @@ def xm_flow_loss(flow_model: NanoFlow, data: Tensor, *, mask: Tensor, candidates
     raw = flow_model(data_k, noise = noise_k, times = times_k, loss_reduction = 'none', **cond_k)
     per_tok = raw.mean(dim = -1) if raw.ndim > mask_k.ndim else raw
     cand_losses = rearrange(masked_mean(per_tok, mask_k, dim = -1), '(b k) -> b k', b = b, k = candidates)
+
     return cand_losses.amin(dim = -1).mean()
 
 # causal transformer flow actor & multi-chunk value critic
 
 class TransformerFlowActor(Module):
-    def __init__(self, *, dim_state, num_cont_actions, dim_hidden = 128, depth = 3, heads = 4, max_chunk_size = 16):
+    """ causal transformer velocity field over action chunks """
+
+    def __init__(
+        self,
+        *,
+        dim_state,
+        num_cont_actions,
+        dim_hidden = 128,
+        depth = 3,
+        heads = 4,
+        max_chunk_size = 16
+    ):
         super().__init__()
         self.num_cont_actions = num_cont_actions
         self.max_chunk_size = max_chunk_size
@@ -199,18 +245,29 @@ class TransformerFlowActor(Module):
         noised_actions, inverse_seq = pack_with_inverse(noised_actions, 'b * d')
         seq = noised_actions.shape[1]
 
-        state_tok = rearrange(self.state_proj(cond_state), 'b d -> b 1 d')
-        act_tok = (
-            self.action_proj(noised_actions)
-            + self.time_proj(rearrange(times, 'b -> b 1 1'))
-            + self.pos_emb(arange(seq, device = noised_actions.device))
+        state_tokens = rearrange(self.state_proj(cond_state), 'b d -> b 1 d')
+        action_tokens = (
+            self.action_proj(noised_actions) +
+            self.time_proj(rearrange(times, 'b -> b 1 1')) +
+            self.pos_emb(arange(seq, device = noised_actions.device))
         )
 
-        out = self.decoder(cat((state_tok, act_tok), dim = 1))
+        out = self.decoder(cat((state_tokens, action_tokens), dim = 1))
         return inverse_seq(self.to_flow(out[:, 1:]))
 
 class TransformerFlowCritic(Module):
-    def __init__(self, *, dim_state, num_cont_actions, dim_hidden = 128, depth = 3, heads = 4, max_seq_len = 16):
+    """ causal multi-chunk value critic with flow matching & single-pass distillation """
+
+    def __init__(
+        self,
+        *,
+        dim_state,
+        num_cont_actions,
+        dim_hidden = 128,
+        depth = 3,
+        heads = 4,
+        max_seq_len = 16
+    ):
         super().__init__()
         self.max_seq_len = max_seq_len
 
@@ -228,31 +285,34 @@ class TransformerFlowCritic(Module):
         cont_actions, inverse_seq = pack_with_inverse(cont_actions, 'b * d')
         seq = cont_actions.shape[1]
 
-        state_tok = rearrange(self.state_proj(cond_state), 'b d -> b 1 d')
-        act_tok = self.action_proj(cont_actions)
+        state_tokens = rearrange(self.state_proj(cond_state), 'b d -> b 1 d')
+        action_tokens = self.action_proj(cont_actions)
 
         if is_distill:
-            act_tok = einx.add('b s d, 1 1 d', act_tok, self.distill_token)
+            action_tokens = einx.add('b s d, 1 1 d', action_tokens, self.distill_token)
         else:
             val_in = rearrange(values, 'b s -> b s 1') if values.ndim == 2 else values
-            act_tok = act_tok + self.value_proj(val_in) + self.time_proj(rearrange(times, 'b -> b 1 1'))
+            action_tokens = action_tokens + self.value_proj(val_in) + self.time_proj(rearrange(times, 'b -> b 1 1'))
 
-        act_tok = act_tok + self.pos_emb(arange(seq, device = cont_actions.device))
-        out = self.decoder(cat((state_tok, act_tok), dim = 1))
+        action_tokens = action_tokens + self.pos_emb(arange(seq, device = cont_actions.device))
+        out = self.decoder(cat((state_tokens, action_tokens), dim = 1))
+
         return rearrange(inverse_seq(self.to_values(out[:, 1:])), '... 1 -> ...')
 
-# chunk buffer & flow trainer
+# chunk replay buffer & flow trainer
 
 class ChunkReplayBuffer:
     def __init__(self, capacity, max_chunk_size, state_dim, num_actions):
         self.capacity = capacity
         self.max_chunk_size = max_chunk_size
+
         self.states = np.zeros((capacity, state_dim), dtype = np.float32)
         self.actions = np.zeros((capacity, max_chunk_size, num_actions), dtype = np.float32)
         self.rewards = np.zeros((capacity, max_chunk_size), dtype = np.float32)
         self.next_states = np.zeros((capacity, max_chunk_size, state_dim), dtype = np.float32)
         self.terminated = np.zeros((capacity, max_chunk_size), dtype = np.bool_)
         self.valid_lens = np.zeros((capacity,), dtype = np.int64)
+
         self.ptr = 0
         self.size = 0
 
@@ -282,6 +342,7 @@ class ChunkReplayBuffer:
 
     def sample(self, batch_size, dev, recent_fraction = 0.55):
         win = max(batch_size, int(self.size * recent_fraction))
+
         if self.size < self.capacity:
             idx = np.random.randint(max(0, self.size - win), self.size, size = batch_size)
         else:
@@ -319,8 +380,23 @@ class FlowChunkTrainer(Module):
         self.critic_distill_steps = critic_distill_steps
         self.max_grad_norm = max_grad_norm
 
-        self.actor = TransformerFlowActor(dim_state = state_dim, num_cont_actions = num_actions, dim_hidden = hidden_dim, depth = depth, heads = heads, max_chunk_size = max_chunk_size)
-        self.critic = TransformerFlowCritic(dim_state = state_dim, num_cont_actions = num_actions, dim_hidden = hidden_dim, depth = depth, heads = heads, max_seq_len = max_chunk_size)
+        self.actor = TransformerFlowActor(
+            dim_state = state_dim,
+            num_cont_actions = num_actions,
+            dim_hidden = hidden_dim,
+            depth = depth,
+            heads = heads,
+            max_chunk_size = max_chunk_size
+        )
+
+        self.critic = TransformerFlowCritic(
+            dim_state = state_dim,
+            num_cont_actions = num_actions,
+            dim_hidden = hidden_dim,
+            depth = depth,
+            heads = heads,
+            max_seq_len = max_chunk_size
+        )
 
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, update_every = 1, update_after_step = 0)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, update_every = 1, update_after_step = 0)
@@ -348,7 +424,7 @@ class FlowChunkTrainer(Module):
             s, act, rew, ns, term, lens = buffer.sample(batch_size, dev, recent_fraction = recent_frac)
             mask = mask_after(term, True) & lens_to_mask(lens, self.max_chunk_size)
 
-            # 1. causal flow actor with Gladstone forward XM (k = xm_candidates)
+            # causal flow actor with explorative modeling (k = xm_candidates)
 
             actor_loss = xm_flow_loss(
                 self.actor_flow,
@@ -360,7 +436,7 @@ class FlowChunkTrainer(Module):
             )
             update_network_(actor_loss, self.opt_actor, self.max_grad_norm)
 
-            # 2. causal flow critic over SMDP prefix returns bootstrapped from Stage-1 PPO value net
+            # causal flow critic over SMDP prefix returns bootstrapped from Stage-1 value net
 
             with torch.no_grad():
                 flat_ns = rearrange(ns, 'b s d -> (b s) d').to(v_dev)
@@ -377,6 +453,7 @@ class FlowChunkTrainer(Module):
                     cond_state = s,
                     cont_actions = act
                 ).clamp(-5., 5.)
+
                 distill_target = 0.5 * flow_q + 0.5 * target_q
 
             c_flow_loss = xm_flow_loss(
@@ -387,6 +464,7 @@ class FlowChunkTrainer(Module):
                 cond_state = s,
                 cont_actions = act
             )
+
             pred_q = self.critic(cond_state = s, cont_actions = act, is_distill = True)
             c_dist_loss = masked_mean((pred_q - distill_target).square(), mask)
 
@@ -396,22 +474,30 @@ class FlowChunkTrainer(Module):
             c_losses.append(c_flow_loss.item())
             q_means.append(pred_q[mask].mean().item() * 100.)
 
-        return dict(actor_flow = float(np.mean(a_losses)), critic_flow = float(np.mean(c_losses)), mean_q = float(np.mean(q_means)))
+        return dict(
+            actor_flow = float(np.mean(a_losses)),
+            critic_flow = float(np.mean(c_losses)),
+            mean_q = float(np.mean(q_means))
+        )
 
 # frozen DCT-steered flow skill bank + adaptive chunking / value-reassessment wrapper
 
 class FlowChunkBank(Module):
+    """ frozen flow actor/critic skill bank steered in low-frequency DCT-II noise space """
+
     def __init__(
         self,
         actor_model: TransformerFlowActor,
         critic_model: TransformerFlowCritic,
         *,
         dct_modes = 4,
+        corr_alpha = 0.7,
+        lerp_noise = False,
         actor_flow_steps = 4,
         dynamic_chunk = True,
         dynamic_chunk_eps = 0.05,
         min_chunk_len = 1,
-        q_temp = 0.05,
+        q_temp = 0.025,
         reassess_chunk = True,
         reassess_every = 4,
         reassess_threshold = 0.25,
@@ -425,7 +511,12 @@ class FlowChunkBank(Module):
         self.max_chunk_size = actor_model.max_chunk_size
         self.num_actions = actor_model.num_cont_actions
         self.dct_modes = min(dct_modes, self.max_chunk_size)
-        self.latent_dim = self.dct_modes * self.num_actions
+        self.dct_dim = self.dct_modes * self.num_actions
+        self.lerp_noise = lerp_noise
+        self.latent_dim = self.dct_dim + int(lerp_noise)
+
+        self.corr_alpha = corr_alpha
+        self.dct_scale = math.sqrt(self.max_chunk_size / self.dct_modes)
         self.actor_flow_steps = actor_flow_steps
 
         self.dynamic_chunk = dynamic_chunk
@@ -439,11 +530,35 @@ class FlowChunkBank(Module):
 
         self.register_buffer('dct_mat', make_orthonormal_dct(self.max_chunk_size), persistent = False)
 
-    def latent_to_noise_seq(self, latent: Tensor):
+    def dct_to_noise_seq(self, dct_latent: Tensor):
+        if dct_latent.ndim == 1:
+            dct_latent = rearrange(dct_latent, 'd -> 1 d')
+
+        z = rearrange(dct_latent, 'b (k a) -> b k a', k = self.dct_modes, a = self.num_actions)
+        return self.dct_scale * torch.einsum('k h, b k a -> b h a', self.dct_mat[:self.dct_modes], z)
+
+    def compose_noise(self, batch_size: int, latent_action: Tensor | None = None, *, zero_noise = False):
+        dev = next(self.parameters()).device
+
+        if zero_noise:
+            return torch.zeros((batch_size, self.max_chunk_size, self.num_actions), device = dev), torch.zeros(batch_size, device = dev)
+
+        init_noise = sample_pyoco_noise(batch_size, self.max_chunk_size, self.num_actions, self.corr_alpha, dev)
+
+        if not exists(latent_action):
+            return init_noise, torch.zeros(batch_size, device = dev)
+
+        latent = latent_action.to(dev)
         if latent.ndim == 1:
             latent = rearrange(latent, 'd -> 1 d')
-        z = rearrange(latent, 'b (k a) -> b k a', k = self.dct_modes, a = self.num_actions)
-        return torch.einsum('k h, b k a -> b h a', self.dct_mat[:self.dct_modes], z)
+
+        if self.lerp_noise:
+            dct_latent, alpha = latent[:, :-1], latent[:, -1].clamp(0., 1.)
+            constituted = self.dct_to_noise_seq(dct_latent)
+            return init_noise.lerp(constituted, append_dims(alpha, 2)), alpha
+
+        constituted = self.dct_to_noise_seq(latent)
+        return init_noise + constituted, torch.ones(batch_size, device = dev)
 
     @torch.no_grad()
     def critic_q(self, states: Tensor, action_chunks: Tensor):
@@ -451,42 +566,69 @@ class FlowChunkBank(Module):
         return self.critic(cond_state = states.to(dev), cont_actions = action_chunks.to(dev), is_distill = True)
 
     @torch.no_grad()
-    def plan_chunks(self, states: Tensor, latent_noise: Tensor, eval_mode = False):
+    def plan_chunks(
+        self,
+        states: Tensor,
+        latent_action: Tensor | None = None,
+        *,
+        eval_mode = False,
+        zero_noise = False,
+        return_probs = False
+    ):
         dev = next(self.parameters()).device
         states_d = states.to(dev)
-        noise_seq = self.latent_to_noise_seq(latent_noise.to(dev))
+        b = states_d.shape[0]
+
+        noise_seq, alphas = self.compose_noise(b, latent_action, zero_noise = zero_noise)
 
         chunks = self.actor_flow.sample(
             steps = self.actor_flow_steps,
-            batch_size = states_d.shape[0],
+            batch_size = b,
             noise = noise_seq,
             cond_state = states_d
         ).clamp_(-1., 1.)
 
         q_vals = self.critic_q(states_d, chunks)
-        b = states_d.shape[0]
+        logits = q_vals / max(1e-4, self.q_temp)
+
+        if self.min_chunk_len > 1:
+            logits[:, :self.min_chunk_len - 1] = -1e9
+
+        probs = logits.softmax(dim = -1)
 
         # adaptive action chunking via multi-chunk value estimation (Shin et al.)
 
         if not self.dynamic_chunk:
             lens = torch.full((b,), self.max_chunk_size, device = dev, dtype = torch.long)
         else:
-            logits = q_vals / max(1e-4, self.q_temp)
-            if self.min_chunk_len > 1:
-                logits[:, :self.min_chunk_len - 1] = -1e9
+            lens = Categorical(probs = probs).sample() + 1
 
-            lens = Categorical(logits = logits).sample() + 1
             if not eval_mode and self.dynamic_chunk_eps > 0.:
                 rand_mask = torch.rand(b, device = dev) < self.dynamic_chunk_eps
                 rand_lens = torch.randint(self.min_chunk_len, self.max_chunk_size + 1, (b,), device = dev)
                 lens = torch.where(rand_mask, rand_lens, lens)
 
         planned_q = q_vals.gather(1, (lens - 1)[:, None]).squeeze(1)
-        return chunks.cpu().numpy(), lens.cpu().numpy(), planned_q.cpu().numpy()
+        out = (chunks.cpu().numpy(), lens.cpu().numpy(), planned_q.cpu().numpy(), alphas.cpu().numpy())
 
-def step_chunk_envs(envs: list[gym.Env], obs: np.ndarray, bank: FlowChunkBank, latent_actions: Tensor, eval_mode = False):
+        return (*out, probs.cpu().numpy()) if return_probs else out
+
+def step_chunk_envs(
+    envs: list[gym.Env],
+    obs: np.ndarray,
+    bank: FlowChunkBank,
+    latent_actions: Tensor | None = None,
+    *,
+    eval_mode = False,
+    zero_noise = False
+):
     n = len(envs)
-    chunks, plan_lens, planned_qs = bank.plan_chunks(torch.from_numpy(obs).float(), latent_actions, eval_mode = eval_mode)
+    chunks, plan_lens, planned_qs, alphas = bank.plan_chunks(
+        torch.from_numpy(obs).float(),
+        latent_actions,
+        eval_mode = eval_mode,
+        zero_noise = zero_noise
+    )
 
     cur_obs = obs.copy()
     disc_r = np.zeros(n, dtype = np.float32)
@@ -504,12 +646,13 @@ def step_chunk_envs(envs: list[gym.Env], obs: np.ndarray, bank: FlowChunkBank, l
         if not active.any():
             break
 
-        # closed-loop mid-chunk value reassessment (abort remaining chunk on value drop)
+        # closed-loop mid-chunk value reassessment
 
         if k > 0 and bank.reassess_chunk and divisible_by(k, bank.reassess_every):
             idx = np.flatnonzero(active)
             rem_lens = plan_lens[idx] - k
             max_rem = int(rem_lens.max())
+
             rem_chunks = torch.from_numpy(chunks[idx, k:k + max_rem]).float()
             rem_s = torch.from_numpy(cur_obs[idx]).float()
 
@@ -526,6 +669,7 @@ def step_chunk_envs(envs: list[gym.Env], obs: np.ndarray, bank: FlowChunkBank, l
         for i in np.flatnonzero(active):
             next_o, r, term_i, trunc_i, _ = envs[i].step(chunks[i, k])
             rf = float(r)
+
             cur_obs[i] = np.asarray(next_o, dtype = np.float32)
             raw_r[i] += rf
             disc_r[i] += g[i] * rf
@@ -537,7 +681,14 @@ def step_chunk_envs(envs: list[gym.Env], obs: np.ndarray, bank: FlowChunkBank, l
                 terms[i], truncs[i] = term_i, trunc_i
                 active[i] = False
 
-    info = dict(raw_reward = raw_r, last_reward = last_r, prim_steps = durs, planned_len = plan_lens.astype(np.float32), aborted = aborts)
+    info = dict(
+        raw_reward = raw_r,
+        last_reward = last_r,
+        prim_steps = durs,
+        planned_len = plan_lens.astype(np.float32),
+        aborted = aborts,
+        lerp_alpha = alphas.astype(np.float32)
+    )
     return cur_obs, disc_r, terms, truncs, info
 
 class FlowChunkWrapper(gym.Wrapper):
@@ -545,7 +696,10 @@ class FlowChunkWrapper(gym.Wrapper):
         super().__init__(env)
         self.bank = bank
         self.eval_mode = eval_mode
-        self.action_space = gym.spaces.Box(low = -3., high = 3., shape = (bank.latent_dim,), dtype = np.float32)
+
+        low = np.array([-3.] * bank.dct_dim + ([0.] if bank.lerp_noise else []), dtype = np.float32)
+        high = np.array([3.] * bank.dct_dim + ([1.] if bank.lerp_noise else []), dtype = np.float32)
+        self.action_space = gym.spaces.Box(low = low, high = high, dtype = np.float32)
         self._obs = None
 
     def reset(self, **kwargs):
@@ -553,9 +707,10 @@ class FlowChunkWrapper(gym.Wrapper):
         self._obs = np.asarray(obs, dtype = np.float32)
         return obs, info
 
-    def step(self, latent_action):
-        z = rearrange(torch.as_tensor(latent_action, dtype = torch.float32), 'd -> 1 d')
-        next_obs, disc_r, terms, truncs, vinfo = step_chunk_envs([self.env], self._obs[None], self.bank, z, eval_mode = self.eval_mode)
+    def step(self, latent_action = None, *, zero_noise = False):
+        z = rearrange(torch.as_tensor(latent_action, dtype = torch.float32), 'd -> 1 d') if exists(latent_action) else None
+        next_obs, disc_r, terms, truncs, vinfo = step_chunk_envs([self.env], self._obs[None], self.bank, z, eval_mode = self.eval_mode, zero_noise = zero_noise)
+
         self._obs = next_obs[0]
         info = {k: float(v[0]) if k != 'aborted' else bool(v[0] > 0.5) for k, v in vinfo.items()}
         return self._obs.copy(), float(disc_r[0]), bool(terms[0]), bool(truncs[0]), info
@@ -573,13 +728,31 @@ class SimBa(Module):
         return self.norm(x + self.net(x))
 
 class BetaActor(Module):
-    def __init__(self, state_dim, hidden_dim, action_dim, *, bounds = (-1., 1.), init_conc = 5.):
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        *,
+        bounds = (-1., 1.),
+        init_conc = 5.
+    ):
         super().__init__()
         self.action_dim = action_dim
         dim = hidden_dim * 2
-        self.net = Sequential(Linear(state_dim, dim), SimBa(dim), SimBa(dim), Linear(dim, hidden_dim), SiLU(), Linear(hidden_dim, 2 * action_dim))
+
+        self.net = Sequential(
+            Linear(state_dim, dim),
+            SimBa(dim),
+            SimBa(dim),
+            Linear(dim, hidden_dim),
+            SiLU(),
+            Linear(hidden_dim, 2 * action_dim)
+        )
+
         nn.init.orthogonal_(self.net[-1].weight, gain = 0.01)
         nn.init.zeros_(self.net[-1].bias)
+
         self.beta = MeanConcBeta(bounds = bounds, init_conc = init_conc, unimodal = True, eps = 1e-5)
 
     def forward(self, state):
@@ -591,7 +764,7 @@ class BetaActor(Module):
         return action, self.beta.log_prob(dist, action, sum_action_dim = sum_action_dim)
 
     def greedy(self, state):
-        return self.beta.mean(self.forward(state))
+        return self.beta(self.forward(state), temperature = 0.).mean
 
     def log_prob(self, params, action, sum_action_dim = True):
         return self.beta.log_prob(params, action, sum_action_dim = sum_action_dim)
@@ -602,7 +775,12 @@ class BetaActor(Module):
 class Critic(Module):
     def __init__(self, state_dim, hidden_dim = 192):
         super().__init__()
-        self.net = Sequential(Linear(state_dim, hidden_dim), SimBa(hidden_dim), SimBa(hidden_dim), Linear(hidden_dim, 1))
+        self.net = Sequential(
+            Linear(state_dim, hidden_dim),
+            SimBa(hidden_dim),
+            SimBa(hidden_dim),
+            Linear(hidden_dim, 1)
+        )
 
     def forward(self, state):
         return self.net(state).squeeze(-1)
@@ -655,6 +833,7 @@ def ppo_update(
 
         for start in range(0, num_envs, minibatch_envs):
             mb = perm[start:start + minibatch_envs]
+
             mb_s = rearrange(states[mb], 'b t d -> (b t) d')
             mb_a = rearrange(actions[mb], 'b t a -> (b t) a')
             mb_adv = rearrange(gae.advantages[mb], 'b t -> (b t)')
@@ -676,10 +855,189 @@ def ppo_update(
             update_network_(actor_loss, opt_actor, max_grad_norm)
             update_network_(clipped_value_loss_fn(critic(mb_s), mb_val, mb_ret, clip = None), opt_critic)
 
-# evaluation
+# evaluation & HUD trajectory rendering
 
 @torch.no_grad()
-def evaluate_base_policy(actor: BetaActor, *, env_name = 'LunarLander-v3', max_episode_steps = 600, num_episodes = 32, seed = 5000):
+def render_steered_video(
+    bank: FlowChunkBank,
+    student: BetaActor | None,
+    seed: int,
+    mp4_path: str | Path,
+    gif_path: str | Path,
+    *,
+    zero_noise = False,
+    mode_label = 'dct-8d',
+    env_name = 'LunarLander-v3',
+    max_episode_steps = 600
+):
+    if exists(student):
+        student.eval()
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    env = gym.make(env_name, render_mode = 'rgb_array', max_episode_steps = max_episode_steps, continuous = True)
+    obs, _ = env.reset(seed = seed)
+    records, done, ep_ret, dec_idx = [], False, 0., 0
+
+    while not done:
+        z_t = student.greedy(rearrange(torch.from_numpy(obs).float().to(ppo_device), 'd -> 1 d')) if exists(student) else None
+        chunks, plan_lens, planned_qs, alphas, probs = bank.plan_chunks(
+            rearrange(torch.from_numpy(obs).float(), 'd -> 1 d'),
+            z_t,
+            eval_mode = True,
+            zero_noise = zero_noise,
+            return_probs = True
+        )
+
+        chunk, plan_h, planned_q, alpha, h_probs = chunks[0], int(plan_lens[0]), float(planned_qs[0]), float(alphas[0]), probs[0]
+        dec_idx += 1
+        disc_r, g, chunk_recs, was_aborted = 0., 1., [], False
+
+        for k in range(plan_h):
+            if k > 0 and bank.reassess_chunk and divisible_by(k, bank.reassess_every):
+                rem_q = bank.critic_q(
+                    rearrange(torch.from_numpy(obs).float(), 'd -> 1 d'),
+                    rearrange(torch.from_numpy(chunk[k:plan_h]).float(), 's a -> 1 s a')
+                )[0, plan_h - k - 1].item()
+
+                if should_abort_chunk((disc_r / 100.) + g * rem_q, planned_q, bank.reassess_threshold):
+                    was_aborted = True
+                    break
+
+            obs_before = obs.copy()
+            obs, reward, term, trunc, _ = env.step(chunk[k])
+            rf = float(reward)
+            ep_ret += rf
+            disc_r += g * rf
+            g *= bank.gamma
+            chunk_recs.append([env.render(), obs_before, plan_h, k + 1, plan_h, h_probs, alpha, ep_ret, dec_idx, k == 0, False])
+
+            if term or trunc:
+                done = True
+                break
+
+        exec_h = len(chunk_recs)
+        for rec in chunk_recs:
+            rec[4], rec[10] = exec_h, was_aborted
+
+        records.extend(chunk_recs)
+
+    env.close()
+
+    total_frames = len(records)
+    W, H, B = 608, 528, 4
+    font = ImageFont.load_default()
+    show_lerp = bank.lerp_noise and exists(student)
+    frames = []
+
+    for f_idx, (rgb, obs_b, plan_h, step_in_h, exec_h, h_probs, alpha, cum_ret, d_idx, is_start, was_aborted) in enumerate(records):
+        col = dt_color_rgb(exec_h, bank.max_chunk_size)
+        canvas = Image.new('RGB', (W, H), (20, 24, 33))
+        draw = ImageDraw.Draw(canvas)
+
+        draw.rectangle([0, 0, W - 1, 400 + 2 * B - 1], fill = col)
+        canvas.paste(Image.fromarray(rgb), (B, B))
+
+        lx, ly = int(B + 300. + 300. * float(obs_b[0])), int(B + 282. - 200. * float(obs_b[1]))
+        if B + 16 <= lx <= W - B - 16 and B + 16 <= ly <= 400 + B - 16:
+            draw.ellipse([lx - 23, ly - 23, lx + 23, ly + 23], outline = col, width = 2)
+            if is_start:
+                draw.ellipse([lx - 27, ly - 27, lx + 27, ly + 27], outline = (255, 255, 255), width = 1)
+
+        abort_tag = ' ABORT!' if was_aborted else ''
+        draw.rectangle([12, 12, 224, 36], fill = col, outline = (255, 255, 255), width = 1)
+        draw.text((18, 18), f'ACTIVE dt={exec_h:2d} | step {step_in_h:2d}/{plan_h:2d}{abort_tag}', fill = (255, 255, 255), font = font)
+
+        if show_lerp:
+            gate_col = (int(72 + 165 * alpha), int(155 - 35 * alpha), int(239 - 145 * alpha))
+            draw.rectangle([404, 12, 596, 36], fill = (20, 24, 33), outline = gate_col, width = 2)
+            draw.text((412, 18), f'lerp={alpha:.2f} ({"REPLACE" if alpha >= 0.5 else "STEER"})', fill = (245, 248, 255), font = font)
+        else:
+            draw.rectangle([430, 12, 596, 36], fill = (20, 24, 33), outline = (120, 130, 150), width = 1)
+            draw.text((438, 18), mode_label, fill = (230, 236, 248), font = font)
+
+        y0 = 413
+        draw.rectangle([12, y0, 90, y0 + 22], fill = col)
+        draw.text((17, y0 + 6), f'dt={exec_h:2d}/{plan_h:2d}', fill = (255, 255, 255), font = font)
+
+        for s_i in range(bank.max_chunk_size):
+            cx, step_num = 96 + 15 * s_i, s_i + 1
+            if step_num == step_in_h:
+                c_fill, c_out = col, (255, 255, 255)
+            elif step_num < step_in_h:
+                c_fill, c_out = tuple(int(0.50 * v) for v in col), col
+            elif step_num <= exec_h:
+                c_fill, c_out = (38, 44, 58), col
+            elif step_num <= plan_h:
+                c_fill, c_out = (78, 28, 36), (200, 70, 80)
+            else:
+                c_fill, c_out = (27, 31, 42), (48, 54, 68)
+            draw.rectangle([cx, y0 + 3, cx + 12, y0 + 19], fill = c_fill, outline = c_out)
+
+        draw.text((344, y0 + 6), f'Ret:{cum_ret:+6.1f} | Dec#{d_idx:02d} | t={f_idx + 1:03d}/{total_frames:03d}', fill = (235, 240, 248), font = font)
+
+        y1 = 442
+        draw.text((12, y1 + 8), 'P(dt|s):', fill = (180, 188, 204), font = font)
+        p_scale = max(0.16, float(h_probs.max()))
+
+        for h_i in range(bank.max_chunk_size):
+            h_val, bx = h_i + 1, 64 + 18 * h_i
+            c_h = dt_color_rgb(h_val, bank.max_chunk_size)
+            is_sel = (h_val == plan_h)
+            draw.rectangle([bx, y1 + 1, bx + 14, y1 + 20], fill = (32, 37, 48), outline = (255, 255, 255) if is_sel else (56, 63, 79))
+            bh = max(1, int(round(17 * min(1., float(h_probs[h_i]) / p_scale))))
+            draw.rectangle([bx + 1, y1 + 20 - bh, bx + 13, y1 + 19], fill = c_h)
+            if h_val in (1, 4, 8, 12, 16):
+                draw.text((bx + (1 if h_val < 10 else -1), y1 + 21), str(h_val), fill = (255, 255, 255) if is_sel else (155, 165, 182), font = font)
+
+        if show_lerp:
+            gate_col = (int(72 + 165 * alpha), int(155 - 35 * alpha), int(239 - 145 * alpha))
+            draw.text((366, y1 + 1), f'lerp (steer->replace): {alpha:.2f}', fill = (218, 226, 242), font = font)
+            draw.rectangle([366, y1 + 14, 596, y1 + 26], fill = (32, 37, 48), outline = (82, 92, 114))
+            draw.rectangle([367, y1 + 15, 367 + max(1, int(round(228 * alpha))), y1 + 25], fill = gate_col)
+        else:
+            draw.text((366, y1 + 8), f'{mode_label} | P(dt={plan_h})={int(round(100 * h_probs[plan_h - 1])):2d}%', fill = (210, 218, 232), font = font)
+
+        y2, tx0, tw = 481, 12, W - 24
+        draw.rectangle([tx0 - 1, y2 - 1, tx0 + tw + 1, y2 + 22], outline = (95, 105, 125))
+
+        for t_i, rec_i in enumerate(records):
+            x0 = tx0 + int(t_i * tw / total_frames)
+            x1 = max(x0 + 1, tx0 + int((t_i + 1) * tw / total_frames))
+            c_bar = dt_color_rgb(rec_i[4], bank.max_chunk_size)
+            if t_i > f_idx:
+                c_bar = tuple(int(0.35 * v) for v in c_bar)
+            draw.rectangle([x0, y2, x1, y2 + 21], fill = c_bar)
+            if rec_i[9] and t_i > 0:
+                draw.line([(x0, y2), (x0, y2 + 7)], fill = (240, 244, 252))
+
+        cur_x = tx0 + int((f_idx + 0.5) * tw / total_frames)
+        draw.line([(cur_x, y2 - 3), (cur_x, y2 + 24)], fill = (255, 255, 255), width = 2)
+
+        for b_i, lbl in enumerate(('dt 1-4 fine', 'dt 5-8 tact', 'dt 9-12 glide', 'dt 13-16 cruise')):
+            lx0 = 14 + 148 * b_i
+            draw.rectangle([lx0, 511, lx0 + 10, 521], fill = DT_BAND_RGB[b_i])
+            draw.text((lx0 + 15, 511), lbl, fill = (178, 186, 202), font = font)
+
+        frames.append(np.asarray(canvas))
+
+    mp4_path, gif_path = Path(mp4_path).resolve(), Path(gif_path).resolve()
+    mp4_path.parent.mkdir(parents = True, exist_ok = True)
+    imageio.mimsave(str(mp4_path), frames, fps = 50, macro_block_size = 1)
+    imageio.mimsave(str(gif_path), frames[::2], fps = 25, loop = 0)
+
+    return dict(seed = seed, return_val = ep_ret, decisions = dec_idx, frames = total_frames, mp4 = str(mp4_path), gif = str(gif_path))
+
+@torch.no_grad()
+def evaluate_base_policy(
+    actor: BetaActor,
+    *,
+    env_name = 'LunarLander-v3',
+    max_episode_steps = 600,
+    num_episodes = 32,
+    seed = 5000
+):
     actor.eval()
     env = gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True)
     rets, lands = [], 0
@@ -687,6 +1045,7 @@ def evaluate_base_policy(actor: BetaActor, *, env_name = 'LunarLander-v3', max_e
     for ep in range(num_episodes):
         obs, _ = env.reset(seed = seed + ep)
         ep_r, last_r, term = 0., 0., False
+
         while True:
             a = actor.greedy(rearrange(torch.from_numpy(obs).float().to(ppo_device), 'd -> 1 d')).squeeze(0).cpu().numpy()
             obs, r, term, trunc, _ = env.step(a)
@@ -694,12 +1053,19 @@ def evaluate_base_policy(actor: BetaActor, *, env_name = 'LunarLander-v3', max_e
             last_r = float(r)
             if term or trunc:
                 break
+
         rets.append(ep_r)
         lands += int(term and last_r >= 50.)
 
     env.close()
     arr = np.asarray(rets)
-    return dict(mean = float(arr.mean()), std = float(arr.std()), median = float(np.median(arr)), land_rate = 100. * lands / num_episodes)
+
+    return dict(
+        mean = float(arr.mean()),
+        std = float(arr.std()),
+        median = float(np.median(arr)),
+        land_rate = 100. * lands / num_episodes
+    )
 
 @torch.no_grad()
 def evaluate_wrapped_student(
@@ -712,53 +1078,73 @@ def evaluate_wrapped_student(
     num_episodes = 32,
     seed = 7000,
     video_folder = None,
-    video_prefix = 'flow-steered'
+    video_prefix = 'flow-steered',
+    mode_label = 'dct-8d'
 ):
     if exists(student):
         student.eval()
 
-    base_env = gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True, render_mode = 'rgb_array' if exists(video_folder) else None)
-    if exists(video_folder):
-        vdir = Path(video_folder) / video_prefix
-        rmtree(vdir, ignore_errors = True)
-        base_env = gym.wrappers.RecordVideo(base_env, video_folder = str(vdir), name_prefix = video_prefix, episode_trigger = lambda ep: ep == 0, disable_logger = True)
-
+    base_env = gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True)
     env = FlowChunkWrapper(base_env, bank, eval_mode = True)
-    rets, dts, planned_dts, alt_dts, aborts, lands = [], [], [], [], 0, 0
+
+    rets, dts, planned_dts, alphas_all, alt_dts = [], [], [], [], []
+    aborts, lands = 0, 0
     best_ep_r, best_traj = -float('inf'), []
 
     for ep in range(num_episodes):
-        obs, _ = env.reset(seed = seed + ep)
+        ep_seed = seed + ep
+        torch.manual_seed(ep_seed)
+        np.random.seed(ep_seed)
+
+        obs, _ = env.reset(seed = ep_seed)
         ep_r, last_r, term, done = 0., 0., False, False
         ep_traj = []
 
         while not done:
             x0, y0 = float(obs[0]), float(obs[1])
-            if exists(student):
-                z = student.greedy(rearrange(torch.from_numpy(obs).float().to(ppo_device), 'd -> 1 d')).squeeze(0).cpu().numpy()
-            elif zero_noise:
-                z = np.zeros(bank.latent_dim, dtype = np.float32)
-            else:
-                z = np.clip(np.random.randn(bank.latent_dim).astype(np.float32), -3., 3.)
+            z = student.greedy(rearrange(torch.from_numpy(obs).float().to(ppo_device), 'd -> 1 d')).squeeze(0).cpu().numpy() if exists(student) else None
 
-            obs, _, term, trunc, info = env.step(z)
-            dt_step = float(info['prim_steps'])
+            obs, _, term, trunc, info = env.step(z, zero_noise = zero_noise)
+            dt_step, dt_plan, alpha_val = float(info['prim_steps']), float(info['planned_len']), float(info['lerp_alpha'])
+
             ep_r += float(info['raw_reward'])
             last_r = float(info['last_reward'])
             dts.append(dt_step)
-            planned_dts.append(float(info['planned_len']))
-            alt_dts.append([y0, dt_step, float(info['planned_len']), float(info['aborted'])])
-            ep_traj.append([x0, y0, float(obs[0]), float(obs[1]), dt_step])
+            planned_dts.append(dt_plan)
+            alphas_all.append(alpha_val)
+            alt_dts.append([y0, dt_step, dt_plan, float(info['aborted']), alpha_val])
+            ep_traj.append([x0, y0, float(obs[0]), float(obs[1]), dt_step, alpha_val])
+
             aborts += int(info['aborted'])
             done = term or trunc
 
         rets.append(ep_r)
+        lands += int(term and last_r >= 50.)
         if ep_r > best_ep_r:
             best_ep_r, best_traj = ep_r, ep_traj
-        lands += int(term and last_r >= 50.)
 
     env.close()
     arr = np.asarray(rets)
+    ranked_idx = np.argsort(arr)
+    median_seed = int(seed + ranked_idx[len(ranked_idx) // 2])
+    best_seed = int(seed + ranked_idx[-1])
+
+    video_meta = None
+    if exists(video_folder):
+        out_dir = Path(video_folder)
+        out_dir.mkdir(parents = True, exist_ok = True)
+        pick_seed = best_seed if exists(student) else median_seed
+
+        video_meta = render_steered_video(
+            bank, student, pick_seed,
+            out_dir / f'{video_prefix}.mp4',
+            out_dir / f'{video_prefix}.gif',
+            zero_noise = zero_noise,
+            mode_label = mode_label,
+            env_name = env_name,
+            max_episode_steps = max_episode_steps
+        )
+
     return dict(
         mean = float(arr.mean()),
         std = float(arr.std()),
@@ -767,12 +1153,15 @@ def evaluate_wrapped_student(
         land_rate = 100. * lands / num_episodes,
         avg_dt = float(np.mean(dts)) if dts else 1.,
         avg_planned_dt = float(np.mean(planned_dts)) if planned_dts else 1.,
+        mean_lerp = float(np.mean(alphas_all)) if alphas_all else 0.,
+        std_lerp = float(np.std(alphas_all)) if alphas_all else 0.,
         aborts_per_ep = aborts / max(1, num_episodes),
-        alt_dts = alt_dts[:1200],
+        video = video_meta,
+        alt_dts = alt_dts[:1600],
         best_traj = best_traj
     )
 
-# stage 2: reborn DCT latent-noise steering student (Wagenmaker et al. + MeanConcBeta[-3, 3])
+# stage 2: reborn DCT latent-noise steering student (Wagenmaker et al. + MeanConcBeta)
 
 def train_reborn_student(
     bank: FlowChunkBank,
@@ -780,8 +1169,8 @@ def train_reborn_student(
     label = 'dct-8d',
     env_name = 'LunarLander-v3',
     num_envs = 16,
-    student_updates = 90,
-    macro_rollout_steps = 52,
+    student_updates = 105,
+    macro_rollout_steps = 56,
     max_episode_steps = 600,
     actor_hidden_dim = 108,
     critic_hidden_dim = 192,
@@ -802,24 +1191,28 @@ def train_reborn_student(
     obs = np.stack([e.reset(seed = seed + i)[0] for i, e in enumerate(envs)]).astype(np.float32)
     state_dim = obs.shape[-1]
 
-    # MeanConcBeta([-3, 3], init_conc = 6) => Beta(4, 4) on [-3, 3] with exact mean = 0 and var = 1 at step 0
+    # DCT coords in [-3, 3] (Beta(4, 4) => mean 0, var 1); optional lerp gate in [0, 1] (mean 0.5)
 
-    student = BetaActor(state_dim, actor_hidden_dim, bank.latent_dim, bounds = (-3., 3.), init_conc = student_init_conc).to(ppo_device)
+    bounds = [(-3., 3.)] * bank.dct_dim + [(0., 1.)] if bank.lerp_noise else (-3., 3.)
+    student = BetaActor(state_dim, actor_hidden_dim, bank.latent_dim, bounds = bounds, init_conc = student_init_conc).to(ppo_device)
     critic = Critic(state_dim, critic_hidden_dim).to(ppo_device)
+
     opt_actor = torch.optim.AdamW(student.parameters(), lr = lr)
     opt_critic = torch.optim.AdamW(critic.parameters(), lr = critic_lr)
 
     state = torch.from_numpy(obs).float().to(ppo_device)
     running = np.zeros(num_envs, dtype = np.float32)
-    recent_rets, recent_dts, recent_aborts, history = [], [], [], []
+    recent_rets, recent_dts, recent_aborts, recent_lerps, history = [], [], [], [], []
     best_val, best_state = -float('inf'), deepcopy(student.state_dict())
     env_steps, macro_decs, t0 = 0, 0, time.time()
 
-    print(f'\n[stage 2 | {label}] reborn student MeanConcBeta([-3, 3], dim={bank.latent_dim}, dct_modes={bank.dct_modes})', flush = True)
+    mode_desc = 'lerp(init, dct, alpha in [0, 1])' if bank.lerp_noise else 'init + dct'
+    print(f'\n[stage 2 | {label}] reborn student dim={bank.latent_dim} ({mode_desc})', flush = True)
 
     for upd in range(1, student_updates + 1):
         progress = (upd - 1) / max(1, student_updates)
         ent_coef = schedule_at(BETA_ENTROPY_SCHEDULE, progress)
+
         for pg in opt_actor.param_groups:
             pg['lr'] = lr * schedule_at(LR_SCALE_SCHEDULE, progress)
 
@@ -839,6 +1232,7 @@ def train_reborn_student(
             macro_decs += num_envs
             recent_dts.extend(info['prim_steps'].tolist())
             recent_aborts.extend(info['aborted'].tolist())
+            recent_lerps.extend(info['lerp_alpha'].tolist())
 
             for i in np.flatnonzero(done):
                 recent_rets.append(float(running[i]))
@@ -859,9 +1253,11 @@ def train_reborn_student(
 
         recent_dts = recent_dts[-2048:]
         recent_aborts = recent_aborts[-2048:]
+        recent_lerps = recent_lerps[-2048:]
 
         student.train()
         critic.train()
+
         ppo_update(
             student, critic, opt_actor, opt_critic,
             states = stack(states, dim = 1),
@@ -878,18 +1274,29 @@ def train_reborn_student(
         rec32 = float(np.mean(recent_rets[-32:])) if recent_rets else float('nan')
         avg_dt = float(np.mean(recent_dts[-512:])) if recent_dts else 1.
         abort_rate = 100. * float(np.mean(recent_aborts[-512:])) if recent_aborts else 0.
+        avg_lerp = float(np.mean(recent_lerps[-512:])) if recent_lerps else 1.
 
         if divisible_by(upd, val_every) or upd == student_updates:
             v = evaluate_wrapped_student(bank, student, env_name = env_name, max_episode_steps = max_episode_steps, num_episodes = 16, seed = seed + 4000)
             if v['mean'] >= best_val:
                 best_val, best_state = v['mean'], deepcopy(student.state_dict())
 
-        history.append(dict(update = upd, env_steps = env_steps, decisions = macro_decs, ret32 = rec32, avg_dt = avg_dt, abort_rate = abort_rate, best_val = best_val))
+        history.append(dict(
+            update = upd,
+            env_steps = env_steps,
+            decisions = macro_decs,
+            ret32 = rec32,
+            avg_dt = avg_dt,
+            abort_rate = abort_rate,
+            mean_lerp = avg_lerp,
+            best_val = best_val
+        ))
 
         if divisible_by(upd, log_every) or upd == student_updates:
+            lerp_str = f' | lerp={avg_lerp:.2f}' if bank.lerp_noise else ''
             print(
                 f'  [{label} upd {upd:3d}/{student_updates}] env={env_steps // 1000:4d}k (decs={macro_decs // 1000:3d}k) | '
-                f'ret32={rec32:+6.1f} | val_best={best_val:+6.1f} | avg_dt={avg_dt:4.2f} | abort={abort_rate:4.1f}% [{time.time() - t0:.1f}s]',
+                f'ret32={rec32:+6.1f} | val_best={best_val:+6.1f} | avg_dt={avg_dt:4.2f}{lerp_str} | abort={abort_rate:4.1f}% [{time.time() - t0:.1f}s]',
                 flush = True
             )
 
@@ -897,6 +1304,7 @@ def train_reborn_student(
         e.close()
 
     student.load_state_dict(best_state)
+
     final_eval = evaluate_wrapped_student(
         bank, student,
         env_name = env_name,
@@ -904,12 +1312,15 @@ def train_reborn_student(
         num_episodes = eval_episodes,
         seed = seed + 9000,
         video_folder = video_folder,
-        video_prefix = f'student-{label}'
+        video_prefix = f'student-{label}',
+        mode_label = label
     )
+
+    lerp_eval_str = f' | lerp={final_eval["mean_lerp"]:.2f}+/-{final_eval["std_lerp"]:.2f}' if bank.lerp_noise else ''
     print(
         f'  [{label} eval] {final_eval["mean"]:+.1f} +/- {final_eval["std"]:.1f} '
         f'(median {final_eval["median"]:+.1f}) | land={final_eval["land_rate"]:.1f}% | '
-        f'avg_dt={final_eval["avg_dt"]:.2f} (plan {final_eval["avg_planned_dt"]:.2f}) | aborts/ep={final_eval["aborts_per_ep"]:.2f}',
+        f'avg_dt={final_eval["avg_dt"]:.2f} (plan {final_eval["avg_planned_dt"]:.2f}){lerp_eval_str} | aborts/ep={final_eval["aborts_per_ep"]:.2f}',
         flush = True
     )
     return student, final_eval, history
@@ -920,6 +1331,7 @@ def main(
     env_name = 'LunarLander-v3',
     max_chunk_size = 16,
     dct_modes = 4,
+    lerp_noise = False,
     num_envs = 16,
     max_episode_steps = 600,
     base_updates = 95,
@@ -936,12 +1348,12 @@ def main(
     corr_alpha = 0.7,
     xm_candidates = 2,
     actor_flow_steps = 4,
-    q_temp = 0.05,
+    q_temp = 0.025,
     reassess_chunk = True,
     reassess_every = 4,
     reassess_threshold = 0.25,
-    student_updates = 90,
-    macro_rollout_steps = 52,
+    student_updates = 105,
+    macro_rollout_steps = 56,
     eval_episodes = 32,
     seed = 42,
     render = True,
@@ -957,21 +1369,24 @@ def main(
     np.random.seed(seed)
     random.seed(seed)
 
-    # stage 1: dt = 1 continuous PPO + causal TransformerFlowActor & TransformerFlowCritic (Gladstone XM k = 2)
+    # stage 1: dt = 1 continuous PPO + causal TransformerFlowActor & TransformerFlowCritic (XM k = 2)
 
     base_env = SyncVectorEnv(
         [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)],
         autoreset_mode = AutoresetMode.SAME_STEP
     )
+
     state_dim = base_env.single_observation_space.shape[0]
     num_actions = base_env.single_action_space.shape[0]
 
     base_actor = BetaActor(state_dim, 108, num_actions, bounds = (-1., 1.), init_conc = 5.).to(ppo_device)
     base_critic = Critic(state_dim, 192).to(ppo_device)
+
     opt_actor = torch.optim.AdamW(base_actor.parameters(), lr = 1e-3)
     opt_critic = torch.optim.AdamW(base_critic.parameters(), lr = 2.5e-3)
 
     buffer = ChunkReplayBuffer(buffer_capacity, max_chunk_size, state_dim, num_actions)
+
     flow_trainer = FlowChunkTrainer(
         state_dim = state_dim,
         num_actions = num_actions,
@@ -997,6 +1412,7 @@ def main(
     for upd in range(1, base_updates + 1):
         progress = (upd - 1) / max(1, base_updates)
         ent_coef = schedule_at(BETA_ENTROPY_SCHEDULE, progress)
+
         for pg in opt_actor.param_groups:
             pg['lr'] = 1e-3 * schedule_at(LR_SCALE_SCHEDULE, progress)
 
@@ -1022,6 +1438,7 @@ def main(
             rewards.append(torch.from_numpy(reward / 100.).float().to(ppo_device))
             terms.append(torch.from_numpy(term).bool().to(ppo_device))
             truncs.append(torch.from_numpy(trunc).bool().to(ppo_device))
+
             state = torch.from_numpy(next_obs).float().to(ppo_device)
 
         env_steps += num_envs * base_rollout_steps
@@ -1033,6 +1450,7 @@ def main(
 
         base_actor.train()
         base_critic.train()
+
         ppo_update(
             base_actor, base_critic, opt_actor, opt_critic,
             states = s_t, next_states = ns_t, actions = a_t,
@@ -1067,12 +1485,14 @@ def main(
     teacher_eval = evaluate_base_policy(base_actor, env_name = env_name, max_episode_steps = max_episode_steps, num_episodes = eval_episodes, seed = seed + 6000)
     print(f'  [dt=1 teacher eval] {teacher_eval["mean"]:+.1f} +/- {teacher_eval["std"]:.1f} (median {teacher_eval["median"]:+.1f}) | land={teacher_eval["land_rate"]:.1f}%', flush = True)
 
-    # stage 2: ablations (z = 0 & z ~ N(0, I)) + reborn DCT-8D latent-steering student
+    # stage 2: ablations (z = 0 & unsteered prior) + reborn DCT-8D latent-steering student
 
     bank = FlowChunkBank(
         flow_trainer.ema_actor.ema_model,
         flow_trainer.ema_critic.ema_model,
         dct_modes = dct_modes,
+        corr_alpha = corr_alpha,
+        lerp_noise = lerp_noise,
         actor_flow_steps = actor_flow_steps,
         dynamic_chunk = True,
         q_temp = q_temp,
@@ -1081,9 +1501,20 @@ def main(
         reassess_threshold = reassess_threshold
     ).to(ppo_device)
 
-    results = dict(teacher = teacher_eval, stage1_history = stage1_history, zero_steer = None, unsteered = None, students = {}, histories = {})
+    results = dict(
+        config = dict(max_chunk_size = max_chunk_size, dct_modes = dct_modes, lerp_noise = lerp_noise, q_temp = q_temp, xm_candidates = xm_candidates, seed = seed),
+        teacher = teacher_eval,
+        stage1_history = stage1_history,
+        zero_steer = None,
+        unsteered = None,
+        students = {},
+        histories = {}
+    )
 
-    for key, is_zero, prefix in (('zero_steer', True, 'zero-steer'), ('unsteered', False, 'unsteered-prior')):
+    for key, is_zero, prefix, m_lbl in (
+        ('zero_steer', True, 'zero-steer', 'zero-steer (z=0)'),
+        ('unsteered', False, 'unsteered-prior', 'unsteered prior')
+    ):
         ev = evaluate_wrapped_student(
             bank, None,
             zero_noise = is_zero,
@@ -1092,7 +1523,8 @@ def main(
             num_episodes = eval_episodes,
             seed = seed + 8000,
             video_folder = video_folder if render else None,
-            video_prefix = prefix
+            video_prefix = prefix,
+            mode_label = m_lbl
         )
         results[key] = ev
         print(
@@ -1101,7 +1533,9 @@ def main(
             flush = True
         )
 
-    label = f'dct-{bank.latent_dim}d'
+    suffix = 'lerp' if lerp_noise else 'add'
+    label = f'dct-{bank.dct_dim}d-{suffix}'
+
     _, student_eval, student_hist = train_reborn_student(
         bank,
         label = label,
@@ -1114,6 +1548,7 @@ def main(
         seed = seed + 400,
         video_folder = video_folder if render else None
     )
+
     results['students']['dct'] = student_eval
     results['histories']['dct'] = student_hist
 
@@ -1123,11 +1558,11 @@ def main(
         json.dump(results, f, indent = 2)
 
     z_ev, u_ev = results['zero_steer'], results['unsteered']
-    print(f'\n=== Summary (LunarLander-v3 Continuous | H_max = {max_chunk_size} | XM k = {xm_candidates} | DCT {bank.latent_dim}D) ===', flush = True)
+    print(f'\n=== Summary (LunarLander-v3 Continuous | H_max = {max_chunk_size} | XM k = {xm_candidates} | {label}) ===', flush = True)
     print(f'  Stage 1 Teacher (dt = 1)       : {teacher_eval["mean"]:+6.1f} (median {teacher_eval["median"]:+6.1f}, land {teacher_eval["land_rate"]:4.1f}%, avg_dt = 1.00)', flush = True)
-    print(f'  Zero-Steer Flow Bank (z = 0)   : {z_ev["mean"]:+6.1f} (median {z_ev["median"]:+6.1f}, land {z_ev["land_rate"]:4.1f}%, avg_dt = {z_ev["avg_dt"]:.2f}, aborts/ep = {z_ev["aborts_per_ep"]:.1f})', flush = True)
-    print(f'  Unsteered Flow Bank z ~ N(0,I) : {u_ev["mean"]:+6.1f} (median {u_ev["median"]:+6.1f}, land {u_ev["land_rate"]:4.1f}%, avg_dt = {u_ev["avg_dt"]:.2f}, aborts/ep = {u_ev["aborts_per_ep"]:.1f})', flush = True)
-    print(f'  Reborn Student ({label})        : {student_eval["mean"]:+6.1f} (median {student_eval["median"]:+6.1f}, land {student_eval["land_rate"]:4.1f}%, avg_dt = {student_eval["avg_dt"]:.2f}, aborts/ep = {student_eval["aborts_per_ep"]:.1f})', flush = True)
+    print(f'  Zero-Steer Flow Bank (z = 0)   : {z_ev["mean"]:+6.1f} (median {z_ev["median"]:+6.1f}, land {z_ev["land_rate"]:4.1f}%, avg_dt = {z_ev["avg_dt"]:.2f}, aborts/ep = {z_ev["aborts_per_ep"]:.2f})', flush = True)
+    print(f'  Unsteered Prior Bank           : {u_ev["mean"]:+6.1f} (median {u_ev["median"]:+6.1f}, land {u_ev["land_rate"]:4.1f}%, avg_dt = {u_ev["avg_dt"]:.2f}, aborts/ep = {u_ev["aborts_per_ep"]:.2f})', flush = True)
+    print(f'  Reborn Student ({label:12s})  : {student_eval["mean"]:+6.1f} (median {student_eval["median"]:+6.1f}, land {student_eval["land_rate"]:4.1f}%, avg_dt = {student_eval["avg_dt"]:.2f}, aborts/ep = {student_eval["aborts_per_ep"]:.2f})', flush = True)
 
 if __name__ == '__main__':
     fire.Fire(main)
