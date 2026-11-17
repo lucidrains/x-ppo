@@ -1,9 +1,11 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#   "assoc-scan",
 #   "einops>=0.8.0",
 #   "einx>=0.4.0",
 #   "ema-pytorch>=0.5.2",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d]>=1.0.0",
 #   "imageio[ffmpeg]",
@@ -49,6 +51,7 @@ import einx
 from einops import einsum, rearrange, repeat
 
 from ema_pytorch import EMA
+from env_ssl_wrapper import ActionInterceptor, LatentActionWrapper, StreamBuffer, Translation
 from mean_conc_beta import Beta as MeanConcBeta
 from torch_einops_utils import lens_to_mask, mask_after, masked_mean, pack_with_inverse
 from x_transformers import Decoder
@@ -298,70 +301,6 @@ class TransformerFlowCritic(Module):
 
 # smdp chunk replay buffer & flow trainer
 
-class ChunkReplayBuffer:
-    def __init__(self, capacity: int, max_chunk_size: int, state_dim: int, num_actions: int):
-        self.capacity = capacity
-        self.max_chunk_size = max_chunk_size
-
-        self.states = np.zeros((capacity, state_dim), dtype = np.float32)
-        self.actions = np.zeros((capacity, max_chunk_size, num_actions), dtype = np.float32)
-        self.rewards = np.zeros((capacity, max_chunk_size), dtype = np.float32)
-        self.durations = np.ones((capacity, max_chunk_size), dtype = np.float32)
-        self.next_states = np.zeros((capacity, max_chunk_size, state_dim), dtype = np.float32)
-        self.terminated = np.zeros((capacity, max_chunk_size), dtype = np.bool_)
-        self.valid_lens = np.zeros((capacity,), dtype = np.int64)
-
-        self.ptr = 0
-        self.size = 0
-
-    def add_rollout(
-        self,
-        states: Tensor,
-        next_states: Tensor,
-        actions: Tensor,
-        rewards: Tensor,
-        terminated: Tensor,
-        truncated: Tensor,
-        *,
-        durations: Tensor | None = None,
-        stride = 2
-    ):
-        states_np, next_states_np = states.cpu().numpy(), next_states.cpu().numpy()
-        actions_np, rewards_np = actions.cpu().numpy(), rewards.cpu().numpy()
-        durations_np = durations.cpu().numpy() if exists(durations) else np.ones_like(rewards_np)
-        term_np = terminated.cpu().numpy()
-        done_np = (terminated | truncated).cpu().numpy()
-
-        num_envs, rollout_len, _ = states_np.shape
-        h = self.max_chunk_size
-
-        for t in range(0, rollout_len - h + 1, stride):
-            done_win = done_np[:, t:t + h]
-            lens = np.where(done_win.any(axis = 1), done_win.argmax(axis = 1) + 1, h)
-            idx = (np.arange(num_envs) + self.ptr) % self.capacity
-
-            self.states[idx] = states_np[:, t]
-            self.actions[idx] = actions_np[:, t:t + h]
-            self.rewards[idx] = rewards_np[:, t:t + h]
-            self.durations[idx] = durations_np[:, t:t + h]
-            self.next_states[idx] = next_states_np[:, t:t + h]
-            self.terminated[idx] = term_np[:, t:t + h]
-            self.valid_lens[idx] = lens
-
-            self.ptr = (self.ptr + num_envs) % self.capacity
-            self.size = min(self.capacity, self.size + num_envs)
-
-    def sample(self, batch_size: int, device, recent_fraction = 0.60):
-        window = max(batch_size, int(self.size * recent_fraction))
-
-        if self.size < self.capacity:
-            idx = np.random.randint(max(0, self.size - window), self.size, size = batch_size)
-        else:
-            idx = (self.ptr - np.random.randint(1, window + 1, size = batch_size)) % self.capacity
-
-        arrays = (self.states, self.actions, self.rewards, self.durations, self.next_states, self.terminated, self.valid_lens)
-        return tuple(torch.from_numpy(arr[idx]).to(device) for arr in arrays)
-
 class FlowChunkTrainer(Module):
     def __init__(
         self,
@@ -422,15 +361,19 @@ class FlowChunkTrainer(Module):
         self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
         self.ema_critic.add_to_optimizer_post_step_hook(self.opt_critic)
 
-    def learn(self, buffer: ChunkReplayBuffer, value_net: Module, *, steps = 24, batch_size = 128, recent_frac = 0.60):
+    def learn(self, buffer: StreamBuffer, value_net: Module, *, steps = 24, batch_size = 128, stride = 1, recent_frac = 0.60):
         dev, val_dev = module_device(self), module_device(value_net)
         self.train()
 
         actor_losses, critic_losses, q_means = [], [], []
 
         for _ in range(steps):
-            states, actions, rewards, durations, next_states, terminated, lens = buffer.sample(
-                batch_size, dev, recent_fraction = recent_frac
+            b = buffer.sample_chunks(
+                batch_size, self.max_chunk_size, stride = stride,
+                allow_partial = True, recent_frac = recent_frac, device = dev
+            )
+            states, actions, rewards, durations, next_states, terminated, lens = (
+                b.obs, b.actions, b.rewards, b.durations, b.next_obs, b.terminated, b.valid_lens
             )
             mask = mask_after(terminated, True) & lens_to_mask(lens, self.max_chunk_size)
             mask_f = mask.float()
@@ -496,7 +439,7 @@ class FlowChunkTrainer(Module):
 
 # composable flow chunk skill bank & recursive smdp wrapper
 
-class FlowChunkBank(Module):
+class FlowChunkBank(ActionInterceptor):
     def __init__(
         self,
         actor_model: TransformerFlowActor,
@@ -516,20 +459,27 @@ class FlowChunkBank(Module):
         reassess_threshold = 0.25,
         gamma = 0.99
     ):
-        super().__init__()
+        max_chunk_size = actor_model.max_chunk_size
+        num_actions = actor_model.num_cont_actions
+        eff_dct_modes = min(dct_modes, max_chunk_size)
+        dct_dim = eff_dct_modes * num_actions
+        aux_dim = int(lerp_noise) + (2 if override_chunk_len else 0)
+        latent_dim = dct_dim + aux_dim
+
+        super().__init__(latent_dim = latent_dim, bounds = (-1., 1.), horizon = max_chunk_size, record = False)
         self.actor = deepcopy(actor_model).eval().requires_grad_(False)
         self.critic = deepcopy(critic_model).eval().requires_grad_(False)
-        self.actor_flow = NanoFlow(self.actor, data_shape = (actor_model.max_chunk_size, actor_model.num_cont_actions))
+        self.actor_flow = NanoFlow(self.actor, data_shape = (max_chunk_size, num_actions))
 
-        self.max_chunk_size = actor_model.max_chunk_size
-        self.num_actions = actor_model.num_cont_actions
-        self.dct_modes = min(dct_modes, self.max_chunk_size)
-        self.dct_dim = self.dct_modes * self.num_actions
+        self.max_chunk_size = max_chunk_size
+        self.num_actions = num_actions
+        self.dct_modes = eff_dct_modes
+        self.dct_dim = dct_dim
 
         self.lerp_noise = lerp_noise
         self.override_chunk_len = override_chunk_len
-        self.aux_dim = int(lerp_noise) + (2 if override_chunk_len else 0)
-        self.latent_dim = self.dct_dim + self.aux_dim
+        self.aux_dim = aux_dim
+        self.latent_dim = latent_dim
 
         self.corr_alpha = corr_alpha
         self.dct_scale = math.sqrt(self.max_chunk_size / self.dct_modes)
@@ -658,172 +608,55 @@ class FlowChunkBank(Module):
         out = (chunks.cpu().numpy(), lens.cpu().numpy(), planned_q.cpu().numpy(), meta)
         return (*out, probs.cpu().numpy()) if return_probs else out
 
-def step_envs(
-    envs: list[gym.Env],
-    obs: np.ndarray,
-    actions: Tensor | np.ndarray | None = None,
-    *,
-    banks: tuple[FlowChunkBank, ...] = (),
-    eval_mode = False,
-    zero_noise = False
-):
-    num_envs = len(envs)
+    def translate(self, latent_action, obs, *, eval_mode = False, zero_noise = False):
+        chunks, plan_lens, planned_qs, meta = self.plan_chunks(
+            obs, latent_action, eval_mode = eval_mode, zero_noise = zero_noise
+        )
+        return Translation(
+            actions = chunks,
+            lengths = plan_lens,
+            info = dict(
+                critic_len = meta['critic_lens'].astype(np.float32),
+                desired_len = meta['desired_lens'].astype(np.float32),
+                override_gate = meta['override_gates'].astype(np.float32),
+                overridden = meta['overridden'].astype(np.float32),
+                lerp_alpha = meta['alphas'].astype(np.float32),
+            ),
+            state = dict(planned_qs = planned_qs, overridden = meta['overridden'])
+        )
 
+    def should_abort(
+        self,
+        obs,
+        remaining_actions: Tensor,
+        remaining_lengths: Tensor,
+        *,
+        step: int,
+        discounted_reward: Tensor,
+        discount: Tensor,
+        state = None,
+        **kwargs
+    ):
+        if not self.reassess_chunk or not divisible_by(step, self.reassess_every):
+            return None
+        overridden = np.asarray(state['overridden'], dtype = bool)
+        if overridden.all():
+            return None
+        rem_q = self.critic_q(obs, remaining_actions).cpu().numpy()
+        rem_l = remaining_lengths.detach().cpu().numpy().astype(int)
+        disc_r = discounted_reward.detach().cpu().numpy()
+        disc_f = discount.detach().cpu().numpy()
+        est_total = (disc_r / 100.) + disc_f * rem_q[np.arange(len(rem_l)), rem_l - 1]
+        abort_mask = should_abort_chunk(est_total, state['planned_qs'], self.reassess_threshold)
+        return abort_mask & ~overridden
+
+def wrap_flow_banks(env, banks: tuple[FlowChunkBank, ...], *, eval_mode = False, autoreset = True):
     if len(banks) == 0:
-        act_np = actions.detach().cpu().numpy() if is_tensor(actions) else np.asarray(actions, dtype = np.float32)
-        next_obs = np.empty_like(obs)
-        rewards = np.empty(num_envs, dtype = np.float32)
-        terms = np.zeros(num_envs, dtype = np.bool_)
-        truncs = np.zeros(num_envs, dtype = np.bool_)
-
-        for i, env in enumerate(envs):
-            next_o, r, term_i, trunc_i, _ = env.step(act_np[i])
-            next_obs[i] = next_o
-            rewards[i] = float(r)
-            terms[i] = term_i
-            truncs[i] = trunc_i
-
-        ones = np.ones(num_envs, dtype = np.float32)
-        zeros = np.zeros(num_envs, dtype = np.float32)
-        info = dict(
-            raw_reward = rewards,
-            last_reward = rewards,
-            prim_steps = ones,
-            exec_chunks = ones,
-            planned_len = ones,
-            overridden = zeros,
-            inner_overridden = zeros,
-            aborted = zeros,
-            lerp_alpha = ones
-        )
-        return next_obs, rewards, terms, truncs, info
-
-    bank, *rest_banks = banks
-    latent = torch.as_tensor(actions, dtype = torch.float32) if exists(actions) else None
-    chunks, plan_lens, planned_qs, meta = bank.plan_chunks(
-        torch.from_numpy(obs).float(),
-        latent,
-        eval_mode = eval_mode,
-        zero_noise = zero_noise
-    )
-
-    cur_obs = obs.copy()
-    disc_rewards = np.zeros(num_envs, dtype = np.float32)
-    raw_rewards = np.zeros(num_envs, dtype = np.float32)
-    last_rewards = np.zeros(num_envs, dtype = np.float32)
-    durations = np.zeros(num_envs, dtype = np.float32)
-    exec_chunks = np.zeros(num_envs, dtype = np.float32)
-    inner_ovrs = np.zeros(num_envs, dtype = np.float32)
-    aborts = np.zeros(num_envs, dtype = np.float32)
-
-    terms = np.zeros(num_envs, dtype = np.bool_)
-    truncs = np.zeros(num_envs, dtype = np.bool_)
-    active = np.ones(num_envs, dtype = np.bool_)
-    discount = np.ones(num_envs, dtype = np.float32)
-
-    for k in range(int(plan_lens.max())):
-        active &= (k < plan_lens)
-        if not active.any():
-            break
-
-        # closed-loop mid-chunk value reassessment (bypassed when higher policy overrides critic)
-
-        if k > 0 and bank.reassess_chunk and divisible_by(k, bank.reassess_every):
-            idx = np.flatnonzero(active & ~meta['overridden'])
-
-            if len(idx) > 0:
-                rem_lens = plan_lens[idx] - k
-                rem_chunks = torch.from_numpy(chunks[idx, k:k + int(rem_lens.max())]).float()
-                rem_q = bank.critic_q(torch.from_numpy(cur_obs[idx]).float(), rem_chunks).cpu().numpy()
-                est_total = (disc_rewards[idx] / 100.) + discount[idx] * rem_q[np.arange(len(idx)), rem_lens - 1]
-
-                abort_mask = should_abort_chunk(est_total, planned_qs[idx], bank.reassess_threshold)
-                if abort_mask.any():
-                    aborted_idx = idx[abort_mask]
-                    aborts[aborted_idx] = 1.
-                    active[aborted_idx] = False
-
-        idx = np.flatnonzero(active)
-        if len(idx) == 0:
-            break
-
-        step_obs, step_disc_r, step_term, step_trunc, sub_info = step_envs(
-            [envs[i] for i in idx],
-            cur_obs[idx],
-            chunks[idx, k],
-            banks = tuple(rest_banks),
-            eval_mode = eval_mode
-        )
-
-        cur_obs[idx] = step_obs
-        raw_rewards[idx] += sub_info['raw_reward']
-        disc_rewards[idx] += discount[idx] * step_disc_r
-        last_rewards[idx] = sub_info['last_reward']
-        discount[idx] *= bank.gamma ** sub_info['prim_steps']
-        durations[idx] += sub_info['prim_steps']
-        exec_chunks[idx] += 1.
-        inner_ovrs[idx] += sub_info['overridden']
-        aborts[idx] += sub_info['aborted']
-
-        step_done = step_term | step_trunc
-        if step_done.any():
-            done_idx = idx[step_done]
-            terms[done_idx] = step_term[step_done]
-            truncs[done_idx] = step_trunc[step_done]
-            active[done_idx] = False
-
-    info = dict(
-        raw_reward = raw_rewards,
-        last_reward = last_rewards,
-        prim_steps = durations,
-        exec_chunks = exec_chunks,
-        planned_len = plan_lens.astype(np.float32),
-        critic_len = meta['critic_lens'].astype(np.float32),
-        desired_len = meta['desired_lens'].astype(np.float32),
-        override_gate = meta['override_gates'].astype(np.float32),
-        overridden = meta['overridden'].astype(np.float32),
-        inner_overridden = inner_ovrs / np.maximum(1., exec_chunks),
-        aborted = aborts,
-        lerp_alpha = meta['alphas'].astype(np.float32)
-    )
-    return cur_obs, disc_rewards, terms, truncs, info
-
-class FlowChunkWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env, bank: FlowChunkBank, eval_mode = True):
-        super().__init__(env)
-        if isinstance(env, FlowChunkWrapper):
-            self.base_env = env.base_env
-            self.banks = (bank, *env.banks)
-        else:
-            self.base_env = env
-            self.banks = (bank,)
-
-        self.bank = bank
-        self.eval_mode = eval_mode
-        self.action_space = gym.spaces.Box(low = -1., high = 1., shape = (bank.latent_dim,), dtype = np.float32)
-        self._obs = None
-
-    def reset(self, **kwargs):
-        obs, info = self.base_env.reset(**kwargs)
-        self._obs = np.asarray(obs, dtype = np.float32)
-        return obs, info
-
-    def step(self, latent_action = None, *, zero_noise = False):
-        latent = rearrange(torch.as_tensor(latent_action, dtype = torch.float32), 'd -> 1 d') if exists(latent_action) else None
-        next_obs, disc_r, terms, truncs, vec_info = step_envs(
-            [self.base_env],
-            rearrange(self._obs, 'd -> 1 d'),
-            latent,
-            banks = self.banks,
-            eval_mode = self.eval_mode,
-            zero_noise = zero_noise
-        )
-        self._obs = next_obs[0]
-        info = {
-            k: (bool(v[0] > 0.5) if k in ('aborted', 'overridden') else float(v[0]))
-            for k, v in vec_info.items()
-        }
-        return self._obs.copy(), float(disc_r[0]), bool(terms[0]), bool(truncs[0]), info
+        return LatentActionWrapper(env, ActionInterceptor(passthrough = True, record = False), autoreset = autoreset)
+    wrapped = env
+    for idx_b, b in enumerate(reversed(banks)):
+        wrapped = LatentActionWrapper(wrapped, b, gamma = b.gamma, eval_mode = eval_mode, autoreset = (autoreset if idx_b == 0 else False), record = False)
+    return wrapped
 
 # ppo networks (SimBa + MeanConcBeta) & smdp-hpo update
 
@@ -1400,9 +1233,8 @@ def evaluate_policy(
     is_base = len(banks) == 0
     is_super = len(banks) > 1
     env = gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True)
-
-    for b in reversed(banks):
-        env = FlowChunkWrapper(env, b, eval_mode = True)
+    if not is_base:
+        env = wrap_flow_banks(env, banks, eval_mode = True, autoreset = False)
 
     max_h = 1 if is_base else banks[0].max_chunk_size
     horizons = tuple(range(1, max_h + 1))
@@ -1430,19 +1262,20 @@ def evaluate_policy(
                 ep_ret += last_r
             else:
                 obs, _, term, trunc, info = env.step(action, zero_noise = zero_noise)
-                prim_steps = float(info['prim_steps'])
-                exec_k = max(1, min(max_h, int(round(info['exec_chunks']))))
+                prim_steps = float(info['duration'])
+                exec_k = max(1, min(max_h, int(round(info['executed_steps']))))
                 last_r = float(info['last_reward'])
                 ep_ret += float(info['raw_reward'])
+                lower_inf = info.get('lower_info', {})
 
                 dts.append(prim_steps)
-                plan_dts.append(float(info['planned_len']))
-                ovrs.append(float(info['overridden']))
-                inner_ovrs.append(float(info['inner_overridden']))
+                plan_dts.append(float(info['planned_steps']))
+                ovrs.append(float(info.get('overridden', 0.)))
+                inner_ovrs.append(float(lower_inf.get('overridden', 0.)))
                 outer_ks.append(float(exec_k))
                 dec_by_k[exec_k] += 1
                 step_by_k[exec_k] += int(round(prim_steps))
-                aborts += int(round(float(info['aborted'])))
+                aborts += int(bool(info['aborted']) or bool(lower_inf.get('aborted', False)))
 
             done = term or trunc
 
@@ -1512,7 +1345,7 @@ def harvest_chunks(
     envs: list[gym.Env],
     banks: tuple[FlowChunkBank, ...],
     actor: BetaActor,
-    buffer: ChunkReplayBuffer,
+    buffer: StreamBuffer,
     *,
     rollout_steps = 64,
     seed = 5500
@@ -1521,20 +1354,18 @@ def harvest_chunks(
 
     with torch.random.fork_rng():
         seed_all(seed)
-        obs = np.stack([env.reset(seed = seed + i)[0] for i, env in enumerate(envs)]).astype(np.float32)
-        state = torch.from_numpy(obs).float().to(ppo_device)
 
         for temp in (0.15, 0.35, 0.60):
+            vec_env = wrap_flow_banks(envs, banks, eval_mode = (temp <= 0.2), autoreset = True)
+            obs, _ = vec_env.reset(seed = seed)
+            state = torch.from_numpy(obs).float().to(ppo_device)
             states, next_states, actions, rewards, terms, truncs, durs = ([] for _ in range(7))
 
             for _ in range(rollout_steps):
                 action = actor.sample_temp(state, temperature = temp)
-                true_next, disc_r, term, trunc, info = step_envs(envs, obs, action, banks = banks, eval_mode = (temp <= 0.2))
+                next_obs, disc_r, term, trunc, info = vec_env.step(action)
                 done = term | trunc
-                next_obs = true_next.copy()
-
-                for i in np.flatnonzero(done):
-                    next_obs[i] = np.asarray(envs[i].reset()[0], dtype = np.float32)
+                true_next = np.where(done[:, None], info['final_observation'], next_obs) if (done.any() and 'final_observation' in info) else next_obs
 
                 states.append(state.cpu())
                 next_states.append(torch.from_numpy(true_next).float())
@@ -1542,20 +1373,19 @@ def harvest_chunks(
                 rewards.append(torch.from_numpy(disc_r / 100.).float())
                 terms.append(torch.from_numpy(term).bool())
                 truncs.append(torch.from_numpy(trunc).bool())
-                durs.append(torch.from_numpy(info['prim_steps']).float())
+                durs.append(torch.from_numpy(info['duration']).float())
 
                 obs = next_obs
                 state = torch.from_numpy(obs).float().to(ppo_device)
 
             buffer.add_rollout(
                 stack(states, dim = 1),
-                stack(next_states, dim = 1),
                 stack(actions, dim = 1),
-                stack(rewards, dim = 1),
-                stack(terms, dim = 1),
-                stack(truncs, dim = 1),
+                rewards = stack(rewards, dim = 1),
+                next_obs = stack(next_states, dim = 1),
+                terminated = stack(terms, dim = 1),
+                truncated = stack(truncs, dim = 1),
                 durations = stack(durs, dim = 1),
-                stride = 1
             )
 
 def train_policy_stage(
@@ -1563,7 +1393,7 @@ def train_policy_stage(
     stage_label: str,
     banks: tuple[FlowChunkBank, ...] = (),
     next_flow_trainer: FlowChunkTrainer | None = None,
-    next_buffer: ChunkReplayBuffer | None = None,
+    next_buffer: StreamBuffer | None = None,
     buffer_stride = 1,
     flow_warmup_updates = 1,
     flow_train_every = 3,
@@ -1596,7 +1426,9 @@ def train_policy_stage(
     top_bank = banks[0] if not is_base else None
 
     envs = [gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)]
-    obs = np.stack([env.reset(seed = seed + i)[0] for i, env in enumerate(envs)]).astype(np.float32)
+    vec_env = wrap_flow_banks(envs, banks, eval_mode = False, autoreset = True)
+    obs, _ = vec_env.reset(seed = seed)
+    obs = obs.astype(np.float32)
 
     state_dim = obs.shape[-1]
     action_dim = envs[0].action_space.shape[0] if is_base else top_bank.latent_dim
@@ -1641,22 +1473,21 @@ def train_policy_stage(
             with torch.no_grad():
                 action, lp = actor.sample(state, sum_action_dim = is_base)
 
-            true_next, disc_r, term, trunc, info = step_envs(envs, obs, action, banks = banks, eval_mode = False)
+            next_obs, disc_r, term, trunc, info = vec_env.step(action)
             done = term | trunc
-            next_obs = true_next.copy()
+            true_next = np.where(done[:, None], info['final_observation'], next_obs) if (done.any() and 'final_observation' in info) else next_obs
 
             running += info['raw_reward']
-            env_steps += int(info['prim_steps'].sum())
+            env_steps += int(info['duration'].sum())
             decisions += num_envs
-            recent_dts.extend(info['prim_steps'].tolist())
-            recent_ovrs.extend(info['overridden'].tolist())
+            recent_dts.extend(info['duration'].tolist())
+            recent_ovrs.extend(info['overridden'].tolist() if 'overridden' in info else [0.] * num_envs)
             if is_super:
-                recent_ks.extend(info['exec_chunks'].tolist())
+                recent_ks.extend(info['executed_steps'].tolist())
 
             for i in np.flatnonzero(done):
                 recent_rets.append(float(running[i]))
                 running[i] = 0.
-                next_obs[i] = np.asarray(envs[i].reset()[0], dtype = np.float32)
 
             states.append(state)
             next_states.append(torch.from_numpy(true_next).float().to(ppo_device))
@@ -1665,7 +1496,7 @@ def train_policy_stage(
             rewards.append(torch.from_numpy(disc_r / 100.).float().to(ppo_device))
             terms.append(torch.from_numpy(term).bool().to(ppo_device))
             truncs.append(torch.from_numpy(trunc).bool().to(ppo_device))
-            durs.append(torch.from_numpy(info['prim_steps']).float().to(ppo_device))
+            durs.append(torch.from_numpy(info['duration']).float().to(ppo_device))
 
             obs = next_obs
             state = torch.from_numpy(obs).float().to(ppo_device)
@@ -1704,19 +1535,20 @@ def train_policy_stage(
         if exists(next_buffer):
             with torch.random.fork_rng():
                 next_buffer.add_rollout(
-                    states_t, next_states_t, actions_t, rewards_t, terms_t, truncs_t,
+                    states_t, actions_t,
+                    rewards = rewards_t, next_obs = next_states_t,
+                    terminated = terms_t, truncated = truncs_t,
                     durations = None if is_base else durs_t,
-                    stride = buffer_stride
                 )
                 can_train_flow = (
                     exists(next_flow_trainer)
                     and upd >= flow_warmup_updates
                     and divisible_by(upd, flow_train_every)
-                    and next_buffer.size >= flow_batch_size * 2
+                    and next_buffer.num_chunks(next_flow_trainer.max_chunk_size, stride = buffer_stride, allow_partial = True) >= flow_batch_size * 2
                 )
                 if can_train_flow:
                     flow_stats = next_flow_trainer.learn(
-                        next_buffer, critic, steps = flow_steps_per_iter, batch_size = flow_batch_size
+                        next_buffer, critic, steps = flow_steps_per_iter, batch_size = flow_batch_size, stride = buffer_stride
                     )
 
         avg_dt = float(np.mean(recent_dts[-512:])) if recent_dts else 1.
@@ -1777,10 +1609,12 @@ def train_policy_stage(
         with torch.random.fork_rng():
             flow_stats = next_flow_trainer.learn(
                 next_buffer, critic, steps = flow_consolidate_steps,
-                batch_size = flow_batch_size, recent_frac = 0.65 if harvest_final else 0.60
+                batch_size = flow_batch_size, stride = 1 if harvest_final else buffer_stride,
+                recent_frac = 0.65 if harvest_final else 0.60
             )
+        n_chunks_consol = next_buffer.num_chunks(next_flow_trainer.max_chunk_size, stride = 1 if harvest_final else buffer_stride, allow_partial = True)
         print(
-            f'  [{stage_label} flow consolidated] chunks={next_buffer.size} | '
+            f'  [{stage_label} flow consolidated] chunks={n_chunks_consol} | '
             f'a_flow={flow_stats["actor_flow"]:.3f} | c_flow={flow_stats["critic_flow"]:.3f} | mean_q={flow_stats["mean_q"]:+.1f}',
             flush = True
         )
@@ -1928,7 +1762,7 @@ def main(
 
     # stage 1: dt = 1 teacher + layer-1 causal flow actor/critic (XM k = 2)
 
-    buffer_1 = ChunkReplayBuffer(buffer_capacity, max_chunk_size, state_dim, prim_action_dim)
+    buffer_1 = StreamBuffer(buffer_capacity * 4)
     flow_trainer_1 = FlowChunkTrainer(
         num_actions = prim_action_dim,
         max_chunk_size = max_chunk_size,
@@ -2004,7 +1838,7 @@ def main(
 
     if super_chunk:
         with torch.random.fork_rng():
-            buffer_2 = ChunkReplayBuffer(super_buffer_capacity, super_chunk_size, state_dim, bank_1.latent_dim)
+            buffer_2 = StreamBuffer(super_buffer_capacity * 4)
             flow_trainer_2 = FlowChunkTrainer(
                 num_actions = bank_1.latent_dim,
                 max_chunk_size = super_chunk_size,
@@ -2070,7 +1904,7 @@ def main(
             **stage_kw
         )
 
-        results['layer2_flow'] = dict(buffer_size = buffer_2.size, **flow2_stats)
+        results['layer2_flow'] = dict(buffer_size = buffer_2.num_chunks(super_chunk_size, allow_partial = True), **flow2_stats)
         results['students']['layer2'] = super_eval
         results['histories']['layer2'] = super_hist
 

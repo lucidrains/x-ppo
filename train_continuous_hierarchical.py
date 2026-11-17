@@ -3,6 +3,7 @@
 #   "assoc-scan",
 #   "einops",
 #   "einx",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "imageio[ffmpeg]",
@@ -56,6 +57,7 @@ from einops.layers.torch import Rearrange
 import gymnasium as gym
 from gymnasium.vector import AutoresetMode, SyncVectorEnv
 
+from env_ssl_wrapper import ActionInterceptor, LatentActionWrapper, StreamBuffer
 from mean_conc_beta import Beta as MeanConcBeta
 
 from x_ppo import (
@@ -102,28 +104,9 @@ def resolve_latent_dim(hierarchy: int, num_actions: int, latent_dim: int | None 
     return min(chunk_dim - 1, target)
 
 def true_next_obs(next_obs, done, info):
-    if not done.any() or 'final_obs' not in info:
+    if not done.any() or 'final_observation' not in info:
         return next_obs
-
-    out = next_obs.copy()
-    for i in np.flatnonzero(done):
-        if exists(info['final_obs'][i]):
-            out[i] = info['final_obs'][i]
-    return out
-
-def step_info_array(info, key, done, default_val):
-    out = np.full(done.shape[0], default_val, dtype = np.float32)
-
-    if key in info:
-        mask = info.get(f'_{key}', ~done)
-        out[mask] = info[key][mask]
-
-    if done.any() and 'final_info' in info and key in info['final_info']:
-        f_info = info['final_info']
-        f_mask = f_info.get(f'_{key}', done)
-        out[f_mask] = f_info[key][f_mask]
-
-    return out
+    return np.where(done[:, None], info['final_observation'], next_obs)
 
 def is_strict_landing(obs: np.ndarray, terminated: bool, last_reward: float) -> bool:
     x, y, vx, vy, angle, ang_vel, leg_l, leg_r = (float(v) for v in obs[:8])
@@ -246,7 +229,7 @@ class Critic(Module):
 
 # tanh action chunk compressor
 
-class ActionChunkTanh(Module):
+class ActionChunkTanh(ActionInterceptor):
     def __init__(
         self,
         *,
@@ -259,8 +242,8 @@ class ActionChunkTanh(Module):
         prepend_first_state = False,
         state_recon_weight = 0.1
     ):
-        super().__init__()
         resolved_latent_dim = resolve_latent_dim(hierarchy, num_actions, latent_dim)
+        super().__init__(latent_dim = resolved_latent_dim, horizon = hierarchy, record = False)
 
         self.hierarchy = hierarchy
         self.num_actions = num_actions
@@ -311,6 +294,9 @@ class ActionChunkTanh(Module):
     def decode(self, latents: Tensor) -> Tensor:
         return self.decoder(latents).tanh()
 
+    def translate(self, latents: Tensor) -> Tensor:
+        return self.decode(latents)
+
     def forward(
         self,
         chunks: Tensor,
@@ -355,135 +341,38 @@ class ActionChunkTanh(Module):
 
         return loss, stats
 
-class ChunkBuffer:
-    def __init__(
-        self,
-        *,
-        capacity: int,
-        hierarchy: int,
-        state_dim: int,
-        num_actions: int,
-        stride = 2
-    ):
-        self.capacity = capacity
-        self.hierarchy = hierarchy
-        self.stride = max(1, stride)
+def train_compressor_steps(
+    buffer: StreamBuffer,
+    hierarchy: int,
+    model: ActionChunkTanh,
+    opt: torch.optim.Optimizer,
+    steps = 80,
+    batch_size = 256,
+    stride = 2
+) -> dict:
+    n_avail = buffer.num_chunks(hierarchy, stride = stride)
+    if n_avail < 1:
+        return dict(recon_mse = 0., mae = 0., close_acc = 0., mode_acc = 0., z_std = 0.)
 
-        self.actions = zeros((capacity, hierarchy, num_actions), dtype = torch.float32)
-        self.first_states = zeros((capacity, state_dim), dtype = torch.float32)
-        self.ptr = 0
-        self.size = 0
+    dev = next(model.parameters()).device
+    bs = min(batch_size, n_avail)
+    model.train()
 
-    def add_rollout(
-        self,
-        states: Tensor,
-        actions: Tensor,
-        dones: Tensor
-    ):
-        h = self.hierarchy
-        if states.shape[1] < h:
-            return
+    history = []
+    with torch.random.fork_rng():
+        for _ in range(steps):
+            b = buffer.sample_chunks(bs, hierarchy, stride = stride, device = dev)
+            loss, stats = model(b.actions, b.obs)
 
-        s_win = states.detach().cpu().unfold(1, h, self.stride)
-        d_win = dones.detach().cpu().unfold(1, h, self.stride)
-        a_win = actions.detach().cpu().unfold(1, h, self.stride)
+            opt.zero_grad()
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 1.)
+            opt.step()
 
-        valid = ~d_win[..., :-1].any(dim = -1) if h > 1 else torch.ones_like(d_win[..., 0], dtype = torch.bool)
-        if not valid.any():
-            return
+            history.append(stats)
 
-        first_s = s_win[..., 0][valid][-self.capacity:]
-        act_chunks = rearrange(a_win[valid], 'n a h -> n h a').float()[-self.capacity:]
-        n = act_chunks.shape[0]
-
-        idx = (self.ptr + arange(n)) % self.capacity
-        self.actions[idx] = act_chunks
-        self.first_states[idx] = first_s
-        self.ptr = (self.ptr + n) % self.capacity
-        self.size = min(self.capacity, self.size + n)
-
-    def train_steps(
-        self,
-        model: ActionChunkTanh,
-        opt: torch.optim.Optimizer,
-        steps = 80,
-        batch_size = 256
-    ) -> dict:
-        if self.size < 1:
-            return dict(recon_mse = 0., mae = 0., close_acc = 0., mode_acc = 0., z_std = 0.)
-
-        dev = next(model.parameters()).device
-        bs = min(batch_size, self.size)
-        model.train()
-
-        history = []
-        with torch.random.fork_rng():
-            for _ in range(steps):
-                idx = randint(0, self.size, (bs,))
-                loss, stats = model(self.actions[idx].to(dev), self.first_states[idx].to(dev))
-
-                opt.zero_grad()
-                loss.backward()
-                clip_grad_norm_(model.parameters(), 1.)
-                opt.step()
-
-                history.append(stats)
-
-        tail = history[-16:]
-        return {k: float(np.mean([s[k] for s in tail])) for k in tail[-1]}
-
-# slower macro environment committing to decoded tanh chunks
-
-class TanhMacroEnv(gym.Wrapper):
-    def __init__(
-        self,
-        env: gym.Env,
-        compressor: ActionChunkTanh | None,
-        hierarchy: int,
-        num_actions: int,
-        gamma = 0.99
-    ):
-        super().__init__(env)
-        self.compressor = compressor
-        self.hierarchy = hierarchy
-        self.num_actions = num_actions
-        self.gamma = gamma
-
-        latent_dim = compressor.latent_dim if exists(compressor) else num_actions
-        self.action_space = gym.spaces.Box(low = -1., high = 1., shape = (latent_dim,), dtype = np.float32)
-
-    def step(self, action):
-        act_arr = np.asarray(action, dtype = np.float32)
-
-        # accepts either a latent vector (latent_dim,) or a pre-decoded chunk (hierarchy, num_actions)
-
-        if act_arr.ndim == 2 and act_arr.shape == (self.hierarchy, self.num_actions):
-            prim_seq = act_arr
-        else:
-            assert exists(self.compressor), 'compressor required when stepping with latent vector z'
-            dev = next(self.compressor.parameters()).device
-            with torch.no_grad():
-                z = torch.from_numpy(act_arr).float().unsqueeze(0).to(dev)
-                prim_seq = self.compressor.decode(z).squeeze(0).cpu().numpy()
-
-        disc_reward, raw_reward, prim_steps = 0., 0., 0
-
-        for h in range(self.hierarchy):
-            obs, reward, terminated, truncated, info = self.env.step(prim_seq[h])
-
-            r = float(reward)
-            disc_reward += (self.gamma ** h) * r
-            raw_reward += r
-            prim_steps += 1
-
-            if terminated or truncated:
-                break
-
-        return obs, disc_reward, terminated, truncated, {
-            **info,
-            'raw_reward': raw_reward,
-            'prim_steps': prim_steps
-        }
+    tail = history[-16:]
+    return {k: float(np.mean([s[k] for s in tail])) for k in tail[-1]}
 
 # ppo update
 
@@ -977,10 +866,12 @@ def main(
 
     # stage 1: dt = 1 ppo + intermittent tanh action compression
 
-    base_env = SyncVectorEnv(
+    raw_base_env = SyncVectorEnv(
         [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)],
         autoreset_mode = AutoresetMode.SAME_STEP
     )
+    stage1_ic = ActionInterceptor(passthrough = True, buffer_capacity = buffer_capacity * 2)
+    base_env = LatentActionWrapper(raw_base_env, stage1_ic, gamma = gamma)
 
     state_dim = base_env.single_observation_space.shape[0]
     num_actions = base_env.single_action_space.shape[0]
@@ -1004,10 +895,6 @@ def main(
             for h in active_hierarchies
         }
         comp_opts = {h: torch.optim.AdamW(compressors[h].parameters(), lr = compressor_lr) for h in active_hierarchies}
-        buffers = {
-            h: ChunkBuffer(capacity = buffer_capacity, hierarchy = h, state_dim = state_dim, num_actions = num_actions)
-            for h in active_hierarchies
-        }
         comp_stats = {h: dict(recon_mse = 0., mae = 0., close_acc = 0., mode_acc = 0., z_std = 0.) for h in active_hierarchies}
 
     dims_desc = ', '.join(f'h={h}: {compressors[h].chunk_dim}->{compressors[h].latent_dim}D' for h in active_hierarchies)
@@ -1056,9 +943,6 @@ def main(
         states_t, actions_t = stack(states, dim = 1), stack(actions, dim = 1)
         term_t, trunc_t = stack(terms, dim = 1), stack(truncs, dim = 1)
 
-        for h in active_hierarchies:
-            buffers[h].add_rollout(states_t, actions_t, term_t | trunc_t)
-
         base_actor.train()
         base_critic.train()
         ppo_update(
@@ -1073,8 +957,8 @@ def main(
 
         if divisible_by(upd, compress_every):
             for h in active_hierarchies:
-                if buffers[h].size >= 256:
-                    comp_stats[h] = buffers[h].train_steps(compressors[h], comp_opts[h], steps = compress_steps)
+                if stage1_ic.lower_buffer.num_chunks(h, stride = 2) >= 256:
+                    comp_stats[h] = train_compressor_steps(stage1_ic.lower_buffer, h, compressors[h], comp_opts[h], steps = compress_steps)
 
         rec32 = float(np.mean(recent[-32:])) if recent else float('nan')
 
@@ -1122,7 +1006,7 @@ def main(
         writer.writerows(base_hist)
 
     for h in active_hierarchies:
-        comp_stats[h] = buffers[h].train_steps(compressors[h], comp_opts[h], steps = compress_final_steps, batch_size = 512)
+        comp_stats[h] = train_compressor_steps(stage1_ic.lower_buffer, h, compressors[h], comp_opts[h], steps = compress_final_steps, batch_size = 512)
         compressors[h].eval()
         compressors[h].requires_grad_(False)
         st = comp_stats[h]
@@ -1146,16 +1030,11 @@ def main(
             torch.manual_seed(seed + 1000 * h)
             np.random.seed(seed + 1000 * h)
 
-            macro_env = SyncVectorEnv(
-                [
-                    lambda h_val = h, c_mod = comp: TanhMacroEnv(
-                        gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True),
-                        c_mod, h_val, num_actions = num_actions, gamma = gamma
-                    )
-                    for _ in range(num_envs)
-                ],
+            raw_macro_vec = SyncVectorEnv(
+                [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)],
                 autoreset_mode = AutoresetMode.SAME_STEP
             )
+            macro_env = LatentActionWrapper(raw_macro_vec, comp, gamma = gamma, clip_lower_actions = True, record = False)
 
             macro_actor = BetaActor(state_dim, actor_hidden_dim, lat_dim, beta_init_conc = beta_init_conc).to(device)
             macro_critic = Critic(state_dim, critic_hidden_dim).to(device)
@@ -1189,13 +1068,12 @@ def main(
                 for _ in range(rollout_macro):
                     with torch.no_grad():
                         z, lp = macro_actor.sample(state)
-                        prim_seqs = comp.decode(z).cpu().numpy()
 
-                    next_obs, disc_r, terminated, truncated, info = macro_env.step(prim_seqs)
+                    next_obs, disc_r, terminated, truncated, info = macro_env.step(z)
                     done = terminated | truncated
 
-                    raw_r = step_info_array(info, 'raw_reward', done, 0.)
-                    durs = step_info_array(info, 'prim_steps', done, float(h))
+                    raw_r = info['raw_reward']
+                    durs = info['duration']
 
                     running += raw_r
                     m_steps += int(durs.sum())

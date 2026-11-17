@@ -3,6 +3,7 @@
 #   "assoc-scan",
 #   "einops",
 #   "einx",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "imageio[ffmpeg]",
@@ -52,6 +53,7 @@ from einops.layers.torch import Rearrange
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv, AutoresetMode
 
+from env_ssl_wrapper import ActionBankInterceptor, ActionInterceptor, LatentActionWrapper, StreamBuffer
 from mean_conc_beta import Beta as MeanConcBeta
 from vector_quantize_pytorch import VectorQuantize
 
@@ -86,24 +88,9 @@ def schedule_at(schedule, progress):
     return schedule[max(0, idx)]
 
 def true_next_obs(next_obs, done, info):
-    if not done.any() or 'final_obs' not in info:
+    if not done.any() or 'final_observation' not in info:
         return next_obs
-    out = next_obs.copy()
-    for i in np.flatnonzero(done):
-        if exists(info['final_obs'][i]):
-            out[i] = info['final_obs'][i]
-    return out
-
-def step_info_array(info, key, done, default_val):
-    out = np.full(done.shape[0], default_val, dtype = np.float32)
-    if key in info:
-        mask = info.get(f'_{key}', ~done)
-        out[mask] = info[key][mask]
-    if done.any() and 'final_info' in info and key in info['final_info']:
-        f_info = info['final_info']
-        f_mask = f_info.get(f'_{key}', done)
-        out[f_mask] = f_info[key][f_mask]
-    return out
+    return np.where(done[:, None], info['final_observation'], next_obs)
 
 def format_macro(seq: np.ndarray, continuous = False) -> str:
     if continuous:
@@ -309,103 +296,35 @@ class ActionChunkVQ(Module):
         out = decoded.tanh() if self.continuous else decoded.argmax(dim = -1)
         return out.cpu().numpy()
 
-class ChunkBuffer:
-    def __init__(self, *, capacity: int, hierarchy: int, state_dim: int, num_actions: int, continuous = False, stride = 2):
-        self.capacity = capacity
-        self.hierarchy = hierarchy
-        self.continuous = continuous
-        self.stride = max(1, stride)
+def train_vq_steps(buffer: StreamBuffer, hierarchy: int, model: ActionChunkVQ, opt: torch.optim.Optimizer, steps = 80, batch_size = 256, stride = 2) -> dict:
+    n_avail = buffer.num_chunks(hierarchy, stride = stride)
+    if n_avail < 1:
+        return dict(token_acc = 0., seq_acc = 0., unique_macros = 0)
 
-        act_shape = (capacity, hierarchy, num_actions) if continuous else (capacity, hierarchy)
-        self.actions = zeros(act_shape, dtype = torch.float32 if continuous else torch.long)
-        self.first_states = zeros((capacity, state_dim), dtype = torch.float32)
-        self.ptr = 0
-        self.size = 0
+    dev = next(model.parameters()).device
+    bs = min(batch_size, n_avail)
+    model.train()
 
-    def add_rollout(self, states: Tensor, actions: Tensor, dones: Tensor):
-        h = self.hierarchy
-        if states.shape[1] < h:
-            return
+    with torch.random.fork_rng():
+        if not bool(model.vq._codebook.initted.item()):
+            init_b = buffer.sample_chunks(min(n_avail, max(1024, model.num_codes * 16)), hierarchy, stride = stride, device = dev)
+            with torch.no_grad():
+                model(init_b.actions, init_b.obs)
 
-        s_win = states.detach().cpu().unfold(1, h, self.stride)
-        d_win = dones.detach().cpu().unfold(1, h, self.stride)
-        a_win = actions.detach().cpu().unfold(1, h, self.stride)
+        tok_accs, seq_accs = [], []
+        for _ in range(steps):
+            b = buffer.sample_chunks(bs, hierarchy, stride = stride, device = dev)
+            loss, stats = model(b.actions, b.obs)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            opt.step()
+            tok_accs.append(stats['token_acc'])
+            seq_accs.append(stats['seq_acc'])
 
-        valid = ~d_win[..., :-1].any(dim = -1) if h > 1 else torch.ones_like(d_win[..., 0], dtype = torch.bool)
-        if not valid.any():
-            return
-
-        first_s = s_win[..., 0][valid][-self.capacity:]
-        act_chunks = (rearrange(a_win[valid], 'n a h -> n h a') if self.continuous else a_win[valid].long())[-self.capacity:]
-        n = act_chunks.shape[0]
-
-        idx = (self.ptr + torch.arange(n)) % self.capacity
-        self.actions[idx] = act_chunks
-        self.first_states[idx] = first_s
-        self.ptr = (self.ptr + n) % self.capacity
-        self.size = min(self.capacity, self.size + n)
-
-    def train_steps(self, model: ActionChunkVQ, opt: torch.optim.Optimizer, steps = 80, batch_size = 256) -> dict:
-        if self.size < 1:
-            return dict(token_acc = 0., seq_acc = 0., unique_macros = 0)
-
-        dev = next(model.parameters()).device
-        bs = min(batch_size, self.size)
-        model.train()
-
-        with torch.random.fork_rng():
-            if not bool(model.vq._codebook.initted.item()):
-                init_idx = torch.randint(0, self.size, (min(self.size, max(1024, model.num_codes * 16)),))
-                with torch.no_grad():
-                    model(self.actions[init_idx].to(dev), self.first_states[init_idx].to(dev))
-
-            tok_accs, seq_accs = [], []
-            for _ in range(steps):
-                idx = torch.randint(0, self.size, (bs,))
-                loss, stats = model(self.actions[idx].to(dev), self.first_states[idx].to(dev))
-                opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                opt.step()
-                tok_accs.append(stats['token_acc'])
-                seq_accs.append(stats['seq_acc'])
-
-        table = model.codebook_table()
-        unique_macros = model.num_codes if self.continuous else int(np.unique(table, axis = 0).shape[0])
-        return dict(token_acc = float(np.mean(tok_accs[-16:])), seq_acc = float(np.mean(seq_accs[-16:])), unique_macros = unique_macros)
-
-# slower macro environment committing to decoded vq sequences
-
-class VQMacroEnv(gym.Wrapper):
-    def __init__(self, env: gym.Env, decoded_table: np.ndarray, hierarchy: int, gamma = 0.99, continuous = False):
-        super().__init__(env)
-        self.decoded_table = decoded_table
-        self.hierarchy = hierarchy
-        self.gamma = gamma
-        self.continuous = continuous
-        self.action_space = gym.spaces.Discrete(int(decoded_table.shape[0]))
-
-    def step(self, code_action):
-        prim_seq = self.decoded_table[int(code_action)]
-        disc_reward, raw_reward, prim_steps = 0., 0., 0
-
-        for h in range(self.hierarchy):
-            prim_act = prim_seq[h] if self.continuous else int(prim_seq[h])
-            obs, reward, terminated, truncated, info = self.env.step(prim_act)
-
-            r = float(reward)
-            disc_reward += (self.gamma ** h) * r
-            raw_reward += r
-            prim_steps += 1
-
-            if terminated or truncated:
-                break
-
-        return obs, disc_reward, terminated, truncated, {
-            **info,
-            'raw_reward': raw_reward,
-            'prim_steps': prim_steps
-        }
+    table = model.codebook_table()
+    unique_macros = model.num_codes if model.continuous else int(np.unique(table, axis = 0).shape[0])
+    return dict(token_acc = float(np.mean(tok_accs[-16:])), seq_acc = float(np.mean(seq_accs[-16:])), unique_macros = unique_macros)
 
 # ppo update
 
@@ -662,10 +581,12 @@ def main(
 
     # stage 1: dt = 1 ppo + intermittent vq action compression
 
-    base_env = SyncVectorEnv(
+    raw_base_env = SyncVectorEnv(
         [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = continuous) for _ in range(num_envs)],
         autoreset_mode = AutoresetMode.SAME_STEP
     )
+    stage1_ic = ActionInterceptor(passthrough = True, buffer_capacity = buffer_capacity * 2)
+    base_env = LatentActionWrapper(raw_base_env, stage1_ic, gamma = gamma)
 
     state_dim = base_env.single_observation_space.shape[0]
     num_actions = base_env.single_action_space.shape[0] if continuous else int(base_env.single_action_space.n)
@@ -685,10 +606,6 @@ def main(
             for h in active_hierarchies
         }
         vq_opts = {h: torch.optim.AdamW(vqs[h].parameters(), lr = vq_lr) for h in active_hierarchies}
-        buffers = {
-            h: ChunkBuffer(capacity = buffer_capacity, hierarchy = h, state_dim = state_dim, num_actions = num_actions, continuous = continuous)
-            for h in active_hierarchies
-        }
         vq_stats = {h: dict(seq_acc = 0., token_acc = 0., unique_macros = 0) for h in active_hierarchies}
 
     print(f'[stage 1] dt = 1 PPO + VQ compression for hierarchies {active_hierarchies}', flush = True)
@@ -738,9 +655,6 @@ def main(
         states_t, actions_t = stack(states, dim = 1), stack(actions, dim = 1)
         term_t, trunc_t = stack(terms, dim = 1), stack(truncs, dim = 1)
 
-        for h in active_hierarchies:
-            buffers[h].add_rollout(states_t, actions_t, term_t | trunc_t)
-
         base_actor.train()
         base_critic.train()
         ppo_update(
@@ -755,8 +669,8 @@ def main(
 
         if divisible_by(upd, compress_every):
             for h in active_hierarchies:
-                if buffers[h].size >= 256:
-                    vq_stats[h] = buffers[h].train_steps(vqs[h], vq_opts[h], steps = vq_steps)
+                if stage1_ic.lower_buffer.num_chunks(h, stride = 2) >= 256:
+                    vq_stats[h] = train_vq_steps(stage1_ic.lower_buffer, h, vqs[h], vq_opts[h], steps = vq_steps)
 
         rec32 = float(np.mean(recent[-32:])) if recent else float('nan')
         if not np.isnan(rec32) and rec32 > best_base_rolling:
@@ -781,7 +695,7 @@ def main(
 
     decoded_tables = {}
     for h in active_hierarchies:
-        vq_stats[h] = buffers[h].train_steps(vqs[h], vq_opts[h], steps = vq_final_steps, batch_size = 512)
+        vq_stats[h] = train_vq_steps(stage1_ic.lower_buffer, h, vqs[h], vq_opts[h], steps = vq_final_steps, batch_size = 512)
         vqs[h].eval()
         vqs[h].requires_grad_(False)
         decoded_tables[h] = vqs[h].codebook_table()
@@ -801,10 +715,11 @@ def main(
             torch.manual_seed(seed + 1000 * h)
             np.random.seed(seed + 1000 * h)
 
-            macro_env = SyncVectorEnv(
-                [lambda h_val = h, tbl = table: VQMacroEnv(gym.make(env_name, max_episode_steps = max_episode_steps, continuous = continuous), tbl, h_val, gamma = gamma, continuous = continuous) for _ in range(num_envs)],
+            raw_macro_vec = SyncVectorEnv(
+                [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = continuous) for _ in range(num_envs)],
                 autoreset_mode = AutoresetMode.SAME_STEP
             )
+            macro_env = LatentActionWrapper(raw_macro_vec, ActionBankInterceptor(table, record = False), gamma = gamma)
 
             macro_actor = Actor(state_dim, actor_hidden_dim, num_codes, continuous = False).to(device)
             macro_critic = Critic(state_dim, critic_hidden_dim).to(device)
@@ -835,11 +750,11 @@ def main(
                     with torch.no_grad():
                         code, lp = macro_actor.sample(state)
 
-                    next_obs, disc_r, terminated, truncated, info = macro_env.step(code.cpu().numpy())
+                    next_obs, disc_r, terminated, truncated, info = macro_env.step(code)
                     done = terminated | truncated
 
-                    raw_r = step_info_array(info, 'raw_reward', done, 0.)
-                    durs = step_info_array(info, 'prim_steps', done, float(h))
+                    raw_r = info['raw_reward']
+                    durs = info['duration']
 
                     running += raw_r
                     m_steps += int(durs.sum())

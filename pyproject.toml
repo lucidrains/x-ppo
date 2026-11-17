@@ -37,6 +37,7 @@ Repository = "https://github.com/lucidrains/x-ppo"
 
 [project.optional-dependencies]
 examples = [
+    "env-ssl-wrapper>=0.6.9",
     "fire",
     "gymnasium[box2d]>=1.0.0",
     "imageio[ffmpeg]",

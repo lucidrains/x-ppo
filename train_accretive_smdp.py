@@ -2,6 +2,7 @@
 # dependencies = [
 #   "assoc-scan",
 #   "einops",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "moviepy",
@@ -41,6 +42,7 @@ from torch.nn import Module, ModuleList
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from env_ssl_wrapper import ActionBankInterceptor, LatentActionWrapper
 from vector_quantize_pytorch import VectorQuantize
 
 from x_ppo import (
@@ -90,87 +92,17 @@ def annealed_marginal_ent(base_coef: float, progress: float, hold_frac = 0.25, m
     return base_coef * (min_ratio + (1. - min_ratio) * 0.5 * (1. + math.cos(math.pi * p)))
 
 def true_next_obs(next_obs, done, info):
-    if not done.any() or 'final_obs' not in info:
+    if not done.any():
+        return next_obs
+    if 'final_observation' in info:
+        return np.where(done[:, None], info['final_observation'], next_obs)
+    if 'final_obs' not in info:
         return next_obs
     out = next_obs.copy()
     for i in np.flatnonzero(done):
         if exists(info['final_obs'][i]):
             out[i] = info['final_obs'][i]
     return out
-
-def step_info_array(info, key, done, default_val):
-    out = np.full(done.shape[0], default_val, dtype = np.float32)
-    if key in info:
-        mask = info.get(f'_{key}', ~done)
-        out[mask] = info[key][mask]
-    if done.any() and 'final_info' in info and key in info['final_info']:
-        f_info = info['final_info']
-        f_mask = f_info.get(f'_{key}', done)
-        out[f_mask] = f_info[key][f_mask]
-    return out
-
-# action routing (A_k = A_{k-1} ∪ VQ_{2^k})
-
-@dataclass(frozen = True)
-class ActionBank:
-    name: str
-    horizon: int
-    sequences: tuple[tuple[int, ...], ...]
-
-    @property
-    def count(self) -> int:
-        return len(self.sequences)
-
-class ActionRouter:
-    def __init__(self, num_prim_actions: int, banks: tuple[ActionBank, ...]):
-        self.num_prim_actions = num_prim_actions
-        self.banks = banks
-        self.hierarchies = tuple(b.horizon for b in banks)
-        self.counts = tuple(b.count for b in banks)
-        self.total_actions = sum(self.counts)
-
-        self.horizons, self.bank_ids, self.sequences = [], [], []
-        for bank_idx, bank in enumerate(banks):
-            for seq in bank.sequences:
-                self.horizons.append(bank.horizon)
-                self.bank_ids.append(bank_idx)
-                self.sequences.append(seq)
-
-        self.horizons_np = np.asarray(self.horizons, dtype = np.int64)
-
-    @classmethod
-    def from_base(cls, num_prim_actions: int) -> ActionRouter:
-        return cls(num_prim_actions, (ActionBank('base_dt1', 1, tuple((a,) for a in range(num_prim_actions))),))
-
-    def accrete(self, decoded_table: np.ndarray, *, mode: str = 'union', name: str | None = None) -> ActionRouter:
-        assert mode in ('union', 'override')
-        table = np.asarray(decoded_table, dtype = np.int64)
-        h = int(table.shape[1])
-        seqs = tuple(tuple(int(a) for a in row) for row in table)
-        bank = ActionBank(default(name, f'vq_dt{h}'), h, seqs)
-        return ActionRouter(self.num_prim_actions, (*self.banks, bank) if mode == 'union' else (bank,))
-
-class ActionRoutingWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env, router: ActionRouter, gamma = 0.99):
-        super().__init__(env)
-        self.router = router
-        self.gamma = gamma
-        self.action_space = gym.spaces.Discrete(router.total_actions)
-
-    def step(self, action):
-        seq = self.router.sequences[int(action)]
-        disc_reward, raw_reward, duration = 0., 0., 0
-
-        for step_idx, prim_action in enumerate(seq):
-            obs, reward, terminated, truncated, info = self.env.step(prim_action)
-            r = float(reward)
-            disc_reward += (self.gamma ** step_idx) * r
-            raw_reward += r
-            duration += 1
-            if terminated or truncated:
-                break
-
-        return obs, disc_reward, terminated, truncated, {**info, 'raw_reward': raw_reward, 'duration': duration}
 
 # networks
 
@@ -359,17 +291,17 @@ class ActionChunkVQ(Module):
 # option embedding & semi-markov ppo
 
 class RouterOptionEmbed(Module):
-    def __init__(self, router: ActionRouter, embed_dim = 64, gamma = 0.99):
+    def __init__(self, router: ActionBankInterceptor, embed_dim = 64, gamma = 0.99):
         super().__init__()
         max_h = max(router.hierarchies)
-        num_prim = max(4, router.num_prim_actions)
-        num_banks = len(router.banks)
+        num_prim = max(4, max(max(seq) for seq in router.sequences) + 1)
+        num_banks = router.num_banks
 
         disc_max = sum(gamma ** j for j in range(max_h))
         feat_dim = max_h * num_prim + num_prim + num_banks + 2
         feats = zeros((router.total_actions, feat_dim), dtype = torch.float32)
 
-        for u, (h, b_idx, seq) in enumerate(zip(router.horizons, router.bank_ids, router.sequences)):
+        for u, (h, b_idx, seq) in enumerate(zip(router.horizons.tolist(), router.bank_ids.tolist(), router.sequences)):
             seq_mat = zeros((max_h, num_prim), dtype = torch.float32)
             disc_h = 0.
             for j, prim_a in enumerate(seq):
@@ -413,7 +345,7 @@ class SemiMarkovPPO(Module):
     def __init__(
         self,
         state_dim: int,
-        router: ActionRouter,
+        router: ActionBankInterceptor,
         *,
         hidden_dim = 64,
         critic_hidden_dim = 192,
@@ -648,7 +580,7 @@ class SemiMarkovPPO(Module):
 
 def harvest_and_train_vq(
     agent: SemiMarkovPPO,
-    router: ActionRouter,
+    router: ActionBankInterceptor,
     *,
     target_hierarchy: int,
     filter_chunks: bool = True,
@@ -671,6 +603,7 @@ def harvest_and_train_vq(
             autoreset_mode = AutoresetMode.SAME_STEP
         )
 
+        num_prim_actions = int(base_env.single_action_space.n)
         agent.eval()
         obs, _ = base_env.reset(seed = seed + 900 * target_hierarchy)
 
@@ -814,8 +747,8 @@ def harvest_and_train_vq(
 
         vq = ActionChunkVQ(
             hierarchy = h,
-            num_actions = router.num_prim_actions,
-            codebook_size = router.num_prim_actions * h
+            num_actions = num_prim_actions,
+            codebook_size = num_prim_actions * h
         ).to(device)
 
         chunks_t = torch.from_numpy(chunks_np).long()
@@ -876,7 +809,7 @@ def select_eval_action(
 @torch.no_grad()
 def evaluate_policy(
     ppo: SemiMarkovPPO,
-    router: ActionRouter,
+    router: ActionBankInterceptor,
     *,
     env_name = 'LunarLander-v3',
     max_episode_steps = 600,
@@ -913,7 +846,7 @@ def evaluate_policy(
                 conservative_weight = ppo.conservative_weight
             ).item())
 
-            h, seq = router.horizons[u], router.sequences[u]
+            h, seq = int(router.horizons[u]), router.sequences[u]
             dec_by_h[h] += 1
             n_dec += 1
 
@@ -946,7 +879,7 @@ def evaluate_policy(
 def train_accretion_layer(
     *,
     layer_idx: int,
-    router: ActionRouter,
+    router: ActionBankInterceptor,
     env_step_budget: int,
     stop_return_32: float | None = None,
     use_q_filter: bool = True,
@@ -974,10 +907,11 @@ def train_accretion_layer(
         torch.manual_seed(stage_seed)
         np.random.seed(stage_seed)
 
-        env = SyncVectorEnv(
-            [lambda: ActionRoutingWrapper(gym.make(env_name, max_episode_steps = max_episode_steps), router, gamma = gamma) for _ in range(num_envs)],
+        raw_env = SyncVectorEnv(
+            [lambda: gym.make(env_name, max_episode_steps = max_episode_steps) for _ in range(num_envs)],
             autoreset_mode = AutoresetMode.SAME_STEP
         )
+        env = LatentActionWrapper(raw_env, router, gamma = gamma, record = False)
         state_dim = int(env.single_observation_space.shape[0])
 
         ppo = SemiMarkovPPO(
@@ -1029,8 +963,8 @@ def train_accretion_layer(
                 next_obs, disc_r, terminated, truncated, info = env.step(act_np)
                 done = terminated | truncated
 
-                raw_r = step_info_array(info, 'raw_reward', done, 0.)
-                durs = step_info_array(info, 'duration', done, 1.)
+                raw_r = info['raw_reward']
+                durs = info['duration']
 
                 for h_sel in router.horizons_np[act_np]:
                     h_dec_counts[int(h_sel)] += 1
@@ -1133,7 +1067,7 @@ def main(
         rmtree(video_folder, ignore_errors = True)
 
     probe_env = gym.make(env_name)
-    router = ActionRouter.from_base(int(probe_env.action_space.n))
+    router = ActionBankInterceptor.from_base(int(probe_env.action_space.n), record = False)
     probe_env.close()
 
     print(f'\n[Layer 0] A_0 = {{dt=1}} (early stop at ret32 >= {base_target_return:+.0f})', flush = True)

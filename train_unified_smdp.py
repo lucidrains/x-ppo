@@ -3,6 +3,7 @@
 #   "assoc-scan",
 #   "einops",
 #   "einx",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "imageio[ffmpeg]",
@@ -63,6 +64,7 @@ from torch.nn import Module, ModuleList
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from env_ssl_wrapper import ActionBankInterceptor, ActionInterceptor, LatentActionWrapper, StreamBuffer
 from vector_quantize_pytorch import VectorQuantize
 
 from x_ppo import (
@@ -110,24 +112,9 @@ def schedule_at(schedule, progress):
     return schedule[max(0, idx)]
 
 def true_next_obs(next_obs, done, info):
-    if not done.any() or 'final_obs' not in info:
+    if not done.any() or 'final_observation' not in info:
         return next_obs
-    out = next_obs.copy()
-    for i in np.flatnonzero(done):
-        if exists(info['final_obs'][i]):
-            out[i] = info['final_obs'][i]
-    return out
-
-def step_info_array(info, key, done, default_val):
-    out = np.full(done.shape[0], default_val, dtype = np.float32)
-    if key in info:
-        mask = info.get(f'_{key}', ~done)
-        out[mask] = info[key][mask]
-    if done.any() and 'final_info' in info and key in info['final_info']:
-        f_info = info['final_info']
-        f_mask = f_info.get(f'_{key}', done)
-        out[f_mask] = f_info[key][f_mask]
-    return out
+    return np.where(done[:, None], info['final_observation'], next_obs)
 
 # networks
 
@@ -336,105 +323,36 @@ class ActionChunkVQ(Module):
         quantized = self.vq.get_output_from_indices(torch.arange(self.num_codes, device = dev))
         return self.decoder(quantized).argmax(dim = -1).cpu().numpy()
 
-class ChunkBuffer:
-    def __init__(self, capacity: int, hierarchy: int, stride = 2):
-        self.capacity = capacity
-        self.hierarchy = hierarchy
-        self.stride = stride
-        self.chunks = zeros((capacity, hierarchy), dtype = torch.long)
-        self.ptr, self.size = 0, 0
+def train_vq_steps(buffer: StreamBuffer, hierarchy: int, model: ActionChunkVQ, opt: torch.optim.Optimizer, steps = 80, batch_size = 256, stride = 2):
+    n_avail = buffer.num_chunks(hierarchy, stride = stride)
+    if n_avail < batch_size:
+        return 0., 0
 
-    def add_rollout(self, actions: Tensor, dones: Tensor):
-        h = self.hierarchy
-        if actions.shape[1] < h:
-            return
+    dev = next(model.parameters()).device
+    model.train()
 
-        act_win = actions.detach().cpu().unfold(1, h, self.stride)
-        done_win = dones.detach().cpu().unfold(1, h, self.stride)
-        valid = ~done_win[..., :-1].any(dim = -1) if h > 1 else torch.ones_like(done_win[..., 0], dtype = torch.bool)
-        chunks = act_win[valid].long()[-self.capacity:]
-        n = chunks.shape[0]
-        if n == 0:
-            return
+    with torch.random.fork_rng():
+        if not bool(model.vq._codebook.initted.item()):
+            init_n = min(n_avail, max(1024, model.num_codes * 16))
+            with torch.no_grad():
+                model(buffer.sample_chunks(init_n, hierarchy, stride = stride, device = dev).actions)
 
-        idx = (self.ptr + torch.arange(n)) % self.capacity
-        self.chunks[idx] = chunks
-        self.ptr = (self.ptr + n) % self.capacity
-        self.size = min(self.capacity, self.size + n)
+        accs = []
+        for _ in range(steps):
+            loss, seq_acc = model(buffer.sample_chunks(batch_size, hierarchy, stride = stride, device = dev).actions)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            opt.step()
+            accs.append(float(seq_acc))
 
-    def train_steps(self, model: ActionChunkVQ, opt: torch.optim.Optimizer, steps = 80, batch_size = 256):
-        if self.size < batch_size:
-            return 0., 0
-
-        dev = next(model.parameters()).device
-        model.train()
-
-        with torch.random.fork_rng():
-            if not bool(model.vq._codebook.initted.item()):
-                init_n = min(self.size, max(1024, model.num_codes * 16))
-                with torch.no_grad():
-                    model(self.chunks[torch.randint(0, self.size, (init_n,))].to(dev))
-
-            accs = []
-            for _ in range(steps):
-                loss, seq_acc = model(self.chunks[torch.randint(0, self.size, (batch_size,))].to(dev))
-                opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                opt.step()
-                accs.append(float(seq_acc))
-
-        unique_codes = int(np.unique(model.codebook_table(), axis = 0).shape[0])
-        return float(np.mean(accs[-16:])), unique_codes
-
-# unified environment & semi-markov ppo
-
-class ActionCatalog:
-    def __init__(self, codebooks: dict[int, np.ndarray]):
-        self.hierarchies = tuple(sorted(codebooks))
-        self.counts = tuple(int(codebooks[h].shape[0]) for h in self.hierarchies)
-        self.total_actions = sum(self.counts)
-
-        self.horizons, self.local_codes, self.sequences = [], [], []
-        for h in self.hierarchies:
-            for code_idx, seq in enumerate(codebooks[h]):
-                self.horizons.append(h)
-                self.local_codes.append(code_idx)
-                self.sequences.append(tuple(int(a) for a in seq))
-
-        self.horizons_np = np.asarray(self.horizons, dtype = np.int64)
-
-class UnifiedHierarchyEnv(gym.Wrapper):
-    def __init__(self, env: gym.Env, catalog: ActionCatalog, gamma = 0.99):
-        super().__init__(env)
-        self.catalog = catalog
-        self.gamma = gamma
-        self.action_space = gym.spaces.Discrete(catalog.total_actions)
-
-    def step(self, action):
-        seq = self.catalog.sequences[int(action)]
-        disc_reward, raw_reward, duration, last_reward = 0., 0., 0, 0.
-
-        for step_idx, prim_action in enumerate(seq):
-            obs, reward, terminated, truncated, info = self.env.step(prim_action)
-            last_reward = float(reward)
-            disc_reward += (self.gamma ** step_idx) * last_reward
-            raw_reward += last_reward
-            duration += 1
-            if terminated or truncated:
-                break
-
-        return obs, disc_reward, terminated, truncated, {
-            **info,
-            'raw_reward': raw_reward,
-            'duration': duration,
-            'last_reward': last_reward
-        }
+    unique_codes = int(np.unique(model.codebook_table(), axis = 0).shape[0])
+    return float(np.mean(accs[-16:])), unique_codes
 
 # compositional option embedding across variable horizons (gamma^j sequence, duty cycle, gamma^h)
 
 class CatalogOptionEmbed(Module):
-    def __init__(self, catalog: ActionCatalog, embed_dim = 64, gamma = 0.99):
+    def __init__(self, catalog: ActionBankInterceptor, embed_dim = 64, gamma = 0.99):
         super().__init__()
         max_h = max(catalog.hierarchies)
         num_prim = max(4, max(max(seq) for seq in catalog.sequences) + 1)
@@ -445,7 +363,7 @@ class CatalogOptionEmbed(Module):
         feat_dim = max_h * num_prim + num_prim + num_hier + 2
         feats = zeros((catalog.total_actions, feat_dim), dtype = torch.float32)
 
-        for u, (h, seq) in enumerate(zip(catalog.horizons, catalog.sequences)):
+        for u, (h, seq) in enumerate(zip(catalog.horizons.tolist(), catalog.sequences)):
             seq_mat = zeros((max_h, num_prim), dtype = torch.float32)
             disc_h = 0.
 
@@ -751,10 +669,12 @@ def discover_vq_codebooks(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        env = SyncVectorEnv(
+        raw_env = SyncVectorEnv(
             [lambda: gym.make(env_name, max_episode_steps = max_episode_steps) for _ in range(num_envs)],
             autoreset_mode = AutoresetMode.SAME_STEP
         )
+        stage1_ic = ActionInterceptor(passthrough = True, buffer_capacity = buffer_capacity * 2)
+        env = LatentActionWrapper(raw_env, stage1_ic)
         state_dim = env.single_observation_space.shape[0]
         num_actions = int(env.single_action_space.n)
 
@@ -766,7 +686,6 @@ def discover_vq_codebooks(
 
         vqs = {h: ActionChunkVQ(h, num_actions).to(device) for h in macro_hierarchies}
         vq_opts = {h: torch.optim.AdamW(vqs[h].parameters(), lr = 2e-3) for h in macro_hierarchies}
-        buffers = {h: ChunkBuffer(buffer_capacity, h) for h in macro_hierarchies}
         vq_info = {h: (0., 0) for h in macro_hierarchies}
 
         obs, _ = env.reset(seed = seed)
@@ -808,9 +727,6 @@ def discover_vq_codebooks(
             actions_t = stack(actions, dim = 1)
             term_t, trunc_t = stack(terms, dim = 1), stack(truncs, dim = 1)
 
-            for h in macro_hierarchies:
-                buffers[h].add_rollout(actions_t, term_t | trunc_t)
-
             ppo.update(SMDPRollout(
                 states = stack(states, dim = 1),
                 next_states = stack(next_states, dim = 1),
@@ -824,7 +740,7 @@ def discover_vq_codebooks(
 
             if divisible_by(upd, compress_every):
                 for h in macro_hierarchies:
-                    vq_info[h] = buffers[h].train_steps(vqs[h], vq_opts[h], steps = vq_steps)
+                    vq_info[h] = train_vq_steps(stage1_ic.lower_buffer, h, vqs[h], vq_opts[h], steps = vq_steps)
 
             if divisible_by(upd, 10) or upd == base_updates:
                 ret32 = float(np.mean(recent[-32:])) if recent else float('nan')
@@ -835,7 +751,7 @@ def discover_vq_codebooks(
 
         codebooks = {1: np.arange(num_actions, dtype = np.int64)[:, None]}
         for h in macro_hierarchies:
-            acc, uniq = buffers[h].train_steps(vqs[h], vq_opts[h], steps = vq_final_steps, batch_size = 512)
+            acc, uniq = train_vq_steps(stage1_ic.lower_buffer, h, vqs[h], vq_opts[h], steps = vq_final_steps, batch_size = 512)
             codebooks[h] = vqs[h].codebook_table()
             macros = [''.join(PRIM_NAMES[int(a)] for a in row) for row in codebooks[h]]
             print(f'  [vq h={h}] seq_acc = {100 * acc:.1f}% | unique = {uniq}/{vqs[h].num_codes} | {macros}', flush = True)
@@ -878,10 +794,11 @@ def train_unified_variant(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        env = SyncVectorEnv(
-            [lambda: UnifiedHierarchyEnv(gym.make(env_name, max_episode_steps = max_episode_steps), catalog, gamma = gamma) for _ in range(num_envs)],
+        raw_env = SyncVectorEnv(
+            [lambda: gym.make(env_name, max_episode_steps = max_episode_steps) for _ in range(num_envs)],
             autoreset_mode = AutoresetMode.SAME_STEP
         )
+        env = LatentActionWrapper(raw_env, catalog, gamma = gamma, record = False)
 
         state_dim = env.single_observation_space.shape[0]
         ppo = SemiMarkovPPO(
@@ -935,8 +852,8 @@ def train_unified_variant(
                 next_obs, disc_r, terminated, truncated, info = env.step(act_np)
                 done = terminated | truncated
 
-                raw_r = step_info_array(info, 'raw_reward', done, 0.)
-                durs = step_info_array(info, 'duration', done, 1.)
+                raw_r = info['raw_reward']
+                durs = info['duration']
 
                 for h in catalog.horizons_np[act_np]:
                     h_counts[int(h)] += 1
@@ -1096,7 +1013,7 @@ def evaluate_policy(
                 q_overrides += int(u_t.item() != greedy_u.item())
 
             u = int(u_t.item())
-            h, seq = catalog.horizons[u], catalog.sequences[u]
+            h, seq = int(catalog.horizons[u]), catalog.sequences[u]
 
             used_h.add(h)
             dec_by_h[h] += 1
@@ -1173,7 +1090,7 @@ def render_mixed_video(
             conservative_weight = conservative_weight
         )
         u = int(u_t.item())
-        h, code, seq = catalog.horizons[u], catalog.local_codes[u], catalog.sequences[u]
+        h, code, seq = int(catalog.horizons[u]), int(catalog.local_codes[u]), catalog.sequences[u]
         h_probs = hier_probs_t.squeeze(0).cpu().numpy()
         dec_idx += 1
 
@@ -1358,7 +1275,7 @@ def main(
             seed = seed
         )
 
-    catalog = ActionCatalog(codebooks)
+    catalog = ActionBankInterceptor(codebooks, record = False)
     print(f'\n[stage 2] unified SMDP training ({catalog.total_actions} actions across dt = {catalog.hierarchies})', flush = True)
 
     variants = []

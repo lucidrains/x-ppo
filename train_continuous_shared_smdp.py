@@ -2,6 +2,7 @@
 # dependencies = [
 #   "assoc-scan",
 #   "einops",
+#   "env-ssl-wrapper>=0.6.9",
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "imageio[ffmpeg]",
@@ -46,6 +47,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from einops import pack, rearrange, reduce, repeat
 
+from env_ssl_wrapper import ActionInterceptor, LatentActionWrapper, StreamBuffer, Translation
 from mean_conc_beta import Beta as MeanConcBeta
 
 from torch_einops_utils import (
@@ -107,30 +109,9 @@ def hadamard_directions(dim):
     return F.normalize(cat((dirs, -dirs), dim = 0), dim = -1)
 
 def true_next_obs(next_obs, done, info):
-    if not done.any() or 'final_obs' not in info:
+    if not done.any() or 'final_observation' not in info:
         return next_obs
-
-    out = next_obs.copy()
-
-    for i in np.flatnonzero(done):
-        if exists(info['final_obs'][i]):
-            out[i] = info['final_obs'][i]
-
-    return out
-
-def step_info_array(info, key, done, default_val):
-    out = np.full(done.shape[0], default_val, dtype = np.float32)
-
-    if key in info:
-        mask = info.get(f'_{key}', ~done)
-        out[mask] = info[key][mask]
-
-    if done.any() and 'final_info' in info and key in info['final_info']:
-        final_info = info['final_info']
-        final_mask = final_info.get(f'_{key}', done)
-        out[final_mask] = final_info[key][final_mask]
-
-    return out
+    return np.where(done[:, None], info['final_observation'], next_obs)
 
 def is_strict_landing(obs, terminated, last_reward):
     x, y, vx, vy, angle, ang_vel, leg_l, leg_r = (float(v) for v in obs[:8])
@@ -271,7 +252,7 @@ class Critic(Module):
 
 # shared padded hierarchical tanh autoencoder
 
-class SharedActionChunkTanh(Module):
+class SharedActionChunkTanh(ActionInterceptor):
     def __init__(
         self,
         hierarchies = (1, 2, 4, 8),
@@ -284,8 +265,9 @@ class SharedActionChunkTanh(Module):
         pre_tanh_reg = 1e-3,
         prior_quantile_weight = 0.05
     ):
-        super().__init__()
-        self.hierarchies = tuple(sorted(int(h) for h in hierarchies))
+        hs = tuple(sorted(int(h) for h in hierarchies))
+        super().__init__(latent_dim = latent_dim, bounds = (-1., 1.), horizon = max(hs), record = False)
+        self.hierarchies = hs
         self.num_hierarchies = len(self.hierarchies)
         self.max_hierarchy = max(self.hierarchies)
         self.num_actions = num_actions
@@ -365,11 +347,13 @@ class SharedActionChunkTanh(Module):
         logits = -(rearrange(pred_log2, '... -> ... 1') - self.horizons_log2).square() / temp
         return logits.softmax(dim = -1)
 
-    @torch.no_grad()
-    def to_env_commands(self, latents):
-        pred_lengths, pred_actions, _ = self.decode_raw(latents.clamp(-1., 1.))
-        cmd = cat((rearrange(pred_lengths, '... -> ... 1'), rearrange(pred_actions, '... h a -> ... (h a)')), dim = -1)
-        return cmd.cpu().numpy().astype(np.float32)
+    def translate(self, latents: Tensor) -> Translation:
+        legit_h, _, pred_lengths, pred_actions = self.decode(latents)
+        return Translation(
+            actions = pred_actions,
+            lengths = legit_h,
+            info = dict(horizon = legit_h.float(), pred_length = pred_lengths)
+        )
 
     def forward(self, padded_actions, lengths, prior_samples = None):
         packed = self.pack_padded(padded_actions, lengths)
@@ -407,128 +391,70 @@ class SharedActionChunkTanh(Module):
 
         return total_loss, dict(act_mse = clean_mse, len_mse = len_loss.item(), round_acc = round_acc)
 
-class SharedChunkBuffer:
-    def __init__(
-        self,
-        capacity_per_h,
-        hierarchies,
-        num_actions,
-        pad_value = -2.,
-        stride = 2
-    ):
-        self.capacity = capacity_per_h
-        self.hierarchies = tuple(sorted(int(h) for h in hierarchies))
-        self.max_h = max(self.hierarchies)
-        self.num_actions = num_actions
-        self.pad_value = float(pad_value)
-        self.stride = max(1, stride)
+def shared_buffer_ready(buffer: StreamBuffer, hierarchies: tuple[int, ...], min_per_h = 64, stride = 2) -> bool:
+    return all(buffer.num_chunks(h, stride = 1 if h == 1 else stride) >= min_per_h for h in hierarchies)
 
-        self.padded_actions = {
-            h: full((capacity_per_h, self.max_h, num_actions), self.pad_value, dtype = torch.float32)
-            for h in self.hierarchies
-        }
-        self.ptrs = {h: 0 for h in self.hierarchies}
-        self.sizes = {h: 0 for h in self.hierarchies}
+def train_shared_ae_steps(
+    buffer: StreamBuffer,
+    model: SharedActionChunkTanh,
+    opt: torch.optim.Optimizer,
+    steps = 100,
+    batch_size = 256,
+    prior_init_conc = 3.,
+    stride = 2
+):
+    if not shared_buffer_ready(buffer, model.hierarchies, 16, stride = stride):
+        return dict(act_mse = 0., len_mse = 0., round_acc = 0.)
 
-    def add_rollout(self, actions, dones):
-        acts_cpu, dones_cpu = actions.detach().cpu(), dones.detach().cpu()
+    dev = next(model.parameters()).device
+    model.train()
 
-        for h in self.hierarchies:
-            if acts_cpu.shape[1] < h:
-                continue
+    prior_beta = MeanConcBeta(bounds = (-1., 1.), init_conc = prior_init_conc, unimodal = True, eps = 1e-5).to(dev)
+    prior_dist = prior_beta(torch.zeros(batch_size, model.latent_dim, 2, device = dev))
+    stats_hist = []
 
-            step_stride = 1 if h == 1 else self.stride
-            d_win = dones_cpu.unfold(1, h, step_stride)
-            a_win = acts_cpu.unfold(1, h, step_stride)
+    with torch.random.fork_rng():
+        for _ in range(steps):
+            b = buffer.sample_chunks(batch_size, model.hierarchies, stride = stride, pad_value = model.pad_value, device = dev)
+            loss, stats = model(b.actions, b.valid_lens, prior_samples = prior_dist.sample()[:b.actions.shape[0]])
 
-            valid = ~d_win[..., :-1].any(dim = -1) if h > 1 else torch.ones_like(d_win[..., 0], dtype = torch.bool)
-            if not valid.any():
-                continue
+            opt.zero_grad()
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 1.)
+            opt.step()
 
-            act_chunks = rearrange(a_win[valid], 'n a h -> n h a').float()[-self.capacity:]
-            n = act_chunks.shape[0]
-            idx = (self.ptrs[h] + arange(n)) % self.capacity
+            stats_hist.append(stats)
 
-            buf = self.padded_actions[h]
-            buf[idx] = self.pad_value
-            buf[idx, :h] = act_chunks
+    tail = stats_hist[-16:]
+    return {k: float(np.mean([s[k] for s in tail])) for k in tail[-1]}
 
-            self.ptrs[h] = (self.ptrs[h] + n) % self.capacity
-            self.sizes[h] = min(self.capacity, self.sizes[h] + n)
+@torch.no_grad()
+def evaluate_shared_ae_per_hierarchy(buffer: StreamBuffer, model: SharedActionChunkTanh, max_samples = 2048, stride = 2):
+    dev = next(model.parameters()).device
+    model.eval()
+    report = {}
 
-    def ready(self, min_per_h = 64):
-        return all(sz >= min_per_h for sz in self.sizes.values())
+    for h in model.hierarchies:
+        n_avail = buffer.num_chunks(h, stride = 1 if h == 1 else stride)
+        n = min(max_samples, n_avail)
+        raw_h = buffer.sample_chunks(n, h, stride = 1 if h == 1 else stride, pad_value = model.pad_value, device = dev)
+        x = pad_right_at_dim_to(raw_h.actions, model.max_hierarchy, dim = -2, value = model.pad_value)
+        l = full((n,), h, dtype = torch.long, device = dev)
 
-    def sample(self, batch_size, dev):
-        per_h = max(1, batch_size // len(self.hierarchies))
-        xs, ls = [], []
+        z, _ = model.encode(model.pack_padded(x, l))
+        legit_h, _, pred_l, pred_a = model.decode(z)
 
-        for h in self.hierarchies:
-            idx = randint(0, self.sizes[h], (per_h,))
-            xs.append(self.padded_actions[h][idx])
-            ls.append(full((per_h,), h, dtype = torch.long))
+        diff = pred_a[:, :h] - x[:, :h]
+        report[h] = dict(
+            mse = diff.square().mean().item(),
+            mae = diff.abs().mean().item(),
+            round_acc = 100. * (legit_h == h).float().mean().item(),
+            mean_pred_len = pred_l.mean().item(),
+            std_pred_len = pred_l.std().item(),
+            z_std = z.std().item()
+        )
 
-        return cat(xs, dim = 0).to(dev), cat(ls, dim = 0).to(dev)
-
-    def train_steps(
-        self,
-        model,
-        opt,
-        steps = 100,
-        batch_size = 256,
-        prior_init_conc = 3.
-    ):
-        if not self.ready(16):
-            return dict(act_mse = 0., len_mse = 0., round_acc = 0.)
-
-        dev = next(model.parameters()).device
-        model.train()
-
-        prior_beta = MeanConcBeta(bounds = (-1., 1.), init_conc = prior_init_conc, unimodal = True, eps = 1e-5).to(dev)
-        prior_dist = prior_beta(torch.zeros(batch_size, model.latent_dim, 2, device = dev))
-
-        stats_hist = []
-
-        with torch.random.fork_rng():
-            for _ in range(steps):
-                bx, bl = self.sample(batch_size, dev)
-                loss, stats = model(bx, bl, prior_samples = prior_dist.sample())
-
-                opt.zero_grad()
-                loss.backward()
-                clip_grad_norm_(model.parameters(), 1.)
-                opt.step()
-
-                stats_hist.append(stats)
-
-        tail = stats_hist[-16:]
-        return {k: float(np.mean([s[k] for s in tail])) for k in tail[-1]}
-
-    @torch.no_grad()
-    def evaluate_per_hierarchy(self, model, max_samples = 2048):
-        dev = next(model.parameters()).device
-        model.eval()
-        report = {}
-
-        for h in self.hierarchies:
-            n = min(max_samples, self.sizes[h])
-            x = self.padded_actions[h][:n].to(dev)
-            l = full((n,), h, dtype = torch.long, device = dev)
-
-            z, _ = model.encode(model.pack_padded(x, l))
-            legit_h, _, pred_l, pred_a = model.decode(z)
-
-            diff = pred_a[:, :h] - x[:, :h]
-            report[h] = dict(
-                mse = diff.square().mean().item(),
-                mae = diff.abs().mean().item(),
-                round_acc = 100. * (legit_h == h).float().mean().item(),
-                mean_pred_len = pred_l.mean().item(),
-                std_pred_len = pred_l.std().item(),
-                z_std = z.std().item()
-            )
-
-        return report
+    return report
 
 def load_shared_autoencoder(ckpt_path):
     ck = torch.load(Path(ckpt_path), map_location = device, weights_only = False)
@@ -565,10 +491,12 @@ def discover_shared_autoencoder(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        env = SyncVectorEnv(
+        raw_env = SyncVectorEnv(
             [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)],
             autoreset_mode = AutoresetMode.SAME_STEP
         )
+        stage1_ic = ActionInterceptor(passthrough = True, buffer_capacity = 98304)
+        env = LatentActionWrapper(raw_env, stage1_ic)
 
         state_dim = int(env.single_observation_space.shape[0])
         num_actions = int(env.single_action_space.shape[0])
@@ -587,7 +515,7 @@ def discover_shared_autoencoder(
         ).to(device)
 
         opt_ae = torch.optim.AdamW(autoencoder.parameters(), lr = 2e-3)
-        buffer = SharedChunkBuffer(49152, hierarchies, num_actions, pad_value = pad_value)
+        buffer = stage1_ic.lower_buffer
 
         obs, _ = env.reset(seed = seed)
         state = torch.from_numpy(obs).float().to(device)
@@ -629,8 +557,6 @@ def discover_shared_autoencoder(
             states_t, next_states_t = stack(states, dim = 1), stack(next_states, dim = 1)
             actions_t, old_lp_t = stack(actions, dim = 1), stack(log_probs, dim = 1)
             rewards_t, term_t, trunc_t = stack(rewards, dim = 1), stack(terms, dim = 1), stack(truncs, dim = 1)
-
-            buffer.add_rollout(actions_t, term_t | trunc_t)
 
             with torch.no_grad():
                 values = critic(states_t)
@@ -682,8 +608,8 @@ def discover_shared_autoencoder(
                     c_loss.backward()
                     opt_critic.step()
 
-            if divisible_by(upd, 5) and buffer.ready(64):
-                buffer.train_steps(autoencoder, opt_ae, steps = 120, batch_size = 256, prior_init_conc = prior_init_conc)
+            if divisible_by(upd, 5) and shared_buffer_ready(buffer, autoencoder.hierarchies, 64):
+                train_shared_ae_steps(buffer, autoencoder, opt_ae, steps = 120, batch_size = 256, prior_init_conc = prior_init_conc)
 
             if divisible_by(upd, 15) or upd == base_updates:
                 rec32 = float(np.mean(recent[-32:])) if recent else float('nan')
@@ -691,11 +617,11 @@ def discover_shared_autoencoder(
 
         env.close()
 
-        buffer.train_steps(autoencoder, opt_ae, steps = 500, batch_size = 512, prior_init_conc = prior_init_conc)
+        train_shared_ae_steps(buffer, autoencoder, opt_ae, steps = 500, batch_size = 512, prior_init_conc = prior_init_conc)
         autoencoder.eval()
         autoencoder.requires_grad_(False)
 
-        ae_report = buffer.evaluate_per_hierarchy(autoencoder)
+        ae_report = evaluate_shared_ae_per_hierarchy(buffer, autoencoder)
 
         with torch.no_grad():
             probe_actor = BetaActor(state_dim, 108, latent_dim, beta_init_conc = prior_init_conc).to(device)
@@ -712,74 +638,6 @@ def discover_shared_autoencoder(
             )
 
         return autoencoder, dict(per_hierarchy = ae_report, prior_mix = prior_mix), buffer
-
-# macro environment
-
-class SharedContinuousHierarchyEnv(gym.Wrapper):
-    def __init__(
-        self,
-        env,
-        autoencoder: SharedActionChunkTanh,
-        gamma = 0.99
-    ):
-        super().__init__(env)
-        self.autoencoder = autoencoder
-        self.hierarchies = np.asarray(autoencoder.hierarchies, dtype = np.int64)
-        self.horizons_f = np.asarray(autoencoder.hierarchies, dtype = np.float32)
-        self.max_hierarchy = autoencoder.max_hierarchy
-        self.num_actions = autoencoder.num_actions
-        self.latent_dim = autoencoder.latent_dim
-        self.gamma = gamma
-
-        self.action_space = gym.spaces.Box(
-            low = -1.,
-            high = 1.,
-            shape = (self.latent_dim,),
-            dtype = np.float32
-        )
-
-    def nearest_legit_hierarchy(self, pred_len):
-        idx = int(np.argmin(np.abs(self.horizons_f - pred_len)))
-        return int(self.hierarchies[idx])
-
-    def step(self, action):
-        arr = np.asarray(action, dtype = np.float32)
-
-        # accepts either raw latent z of shape (latent_dim,) or pre-decoded [pred_len_float, flat_actions]
-
-        if arr.shape == (self.latent_dim,):
-            dev = next(self.autoencoder.parameters()).device
-
-            with torch.no_grad():
-                z = rearrange(torch.from_numpy(arr).float().to(dev), 'd -> 1 d')
-                pred_len_t, pred_act_t, _ = self.autoencoder.decode_raw(z.clamp(-1., 1.))
-                pred_len = float(pred_len_t[0].item())
-                prim_seq = pred_act_t[0].cpu().numpy()
-        else:
-            pred_len = float(arr[0])
-            prim_seq = arr[1:].reshape(self.max_hierarchy, self.num_actions)
-
-        h = self.nearest_legit_hierarchy(pred_len)
-
-        disc_reward, raw_reward, duration = 0., 0., 0
-
-        for step_idx in range(h):
-            obs, reward, terminated, truncated, info = self.env.step(np.clip(prim_seq[step_idx], -1., 1.))
-            last_reward = float(reward)
-            disc_reward += (self.gamma ** step_idx) * last_reward
-            raw_reward += last_reward
-            duration += 1
-
-            if terminated or truncated:
-                break
-
-        return obs, disc_reward, terminated, truncated, {
-            **info,
-            'raw_reward': raw_reward,
-            'duration': duration,
-            'horizon': float(h),
-            'pred_length': pred_len
-        }
 
 # option embedding & semi-markov ppo
 
@@ -1143,7 +1001,7 @@ def evaluate_policy(
     ppo.eval()
     ae = ppo.autoencoder
     base_env = gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True)
-    env = SharedContinuousHierarchyEnv(base_env, ae)
+    env = LatentActionWrapper(base_env, ae, clip_lower_actions = True, eval_mode = True)
 
     episodes = []
     dec_by_h = {h: 0 for h in ae.hierarchies}
@@ -1464,10 +1322,11 @@ def train_shared_variant(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        env = SyncVectorEnv(
-            [lambda: SharedContinuousHierarchyEnv(gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True), autoencoder) for _ in range(num_envs)],
+        raw_env = SyncVectorEnv(
+            [lambda: gym.make(env_name, max_episode_steps = max_episode_steps, continuous = True) for _ in range(num_envs)],
             autoreset_mode = AutoresetMode.SAME_STEP
         )
+        env = LatentActionWrapper(raw_env, autoencoder, gamma = 0.99, clip_lower_actions = True, record = False)
 
         state_dim = int(env.single_observation_space.shape[0])
 
@@ -1513,13 +1372,12 @@ def train_shared_variant(
             for _ in range(rollout_decisions):
                 with torch.no_grad():
                     z_t, lp_t, cand_z_t, cand_lp_t = ppo.sample_rollout_action(state, filter_prob = active_filter_prob)
-                    cmds_np = autoencoder.to_env_commands(z_t)
 
-                next_obs, disc_r, terminated, truncated, info = env.step(cmds_np)
+                next_obs, disc_r, terminated, truncated, info = env.step(z_t)
                 done = terminated | truncated
-                raw_r = step_info_array(info, 'raw_reward', done, 0.)
-                durs = step_info_array(info, 'duration', done, 1.)
-                chosen_hs = step_info_array(info, 'horizon', done, 1.)
+                raw_r = info['raw_reward']
+                durs = info['duration']
+                chosen_hs = info['horizon']
 
                 for h_val in chosen_hs.astype(np.int64).tolist():
                     if h_val in h_counts:
