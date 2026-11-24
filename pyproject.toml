@@ -46,6 +46,7 @@ examples = [
     "numpy",
     "pandas",
     "seaborn",
+    "torch-population>=0.0.4",
 ]
 test = [
     "pytest"
