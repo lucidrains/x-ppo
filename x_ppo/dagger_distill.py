@@ -82,18 +82,20 @@ entirely unusable batch comes back as a nan loss the caller can skip). Pass
 
 from __future__ import annotations
 
-from collections import namedtuple
+from collections.abc import Callable
 from functools import partial
-from typing import Callable
+from typing import NamedTuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange, reduce
+from einops import reduce
 from torch import Tensor, is_tensor, nn
-from torch.distributions import Bernoulli, Categorical, Distribution, OneHotCategorical, kl_divergence
+from torch.distributions import Bernoulli, Categorical, Distribution, OneHotCategorical
 from torch.utils import _pytree as pytree
-from torch_einops_utils import bernoulli_kl, categorical_kl, cast_tensor, cross_entropy, masked_mean
+from torch_einops_utils import cast_tensor, cross_entropy, kl_divergence, masked_mean
+
+# helpers
 
 def exists(v):
     return v is not None
@@ -109,9 +111,9 @@ def masked_loss_mean(losses: Tensor) -> Tensor:
     if not finite.any():
         return losses.new_tensor(float('nan'))
 
-    return masked_mean(torch.where(finite, losses, torch.zeros_like(losses)), finite)
+    return masked_mean(torch.where(finite, losses, 0.), finite)
 
-# ------------------------------------------------------------------ action spaces
+# action spaces
 
 DISCRETE_DISTRIBUTIONS = [Categorical, OneHotCategorical, Bernoulli]   # append custom families - probs or logits, sample(), log_prob()
 
@@ -132,11 +134,9 @@ def policy_kind(policy_out) -> str:
     """`discrete` / `continuous` / `mixed` - across every head."""
 
     heads = [leaf for leaf in pytree.tree_leaves(policy_out) if isinstance(leaf, Distribution)]
-
     assert len(heads) > 0, 'a policy output must hold at least one distribution'
 
     discrete = [is_discrete(head) for head in heads]
-
     return 'discrete' if all(discrete) else 'continuous' if not any(discrete) else 'mixed'
 
 def best_action(policy_out, sample = False) -> Tensor:
@@ -157,7 +157,6 @@ def best_action(policy_out, sample = False) -> Tensor:
 
     if is_discrete(distr):
         if sample:
-            # a sampled one-hot draw collapses to the class index
             action = distr.sample()
             return action.argmax(dim = -1) if isinstance(distr, OneHotCategorical) else action
 
@@ -167,9 +166,8 @@ def best_action(policy_out, sample = False) -> Tensor:
     return distr.sample() if sample else default(getattr(distr, 'mode', None), distr.mean)
 
 def to_log_prob_target(label: Tensor, distr: Distribution) -> Tensor:
-    """What `log_prob` wants per distribution family - the label is reshaped to
-    the distribution's shape first, so class indices stored as `(b, 1)` and
-    1-dim actions stored as `(b, 1)` both land right."""
+    """What `log_prob` wants per distribution family - reshapes the label first,
+    so class indices stored as `(b, 1)` and 1-dim actions both land right."""
 
     if isinstance(distr, OneHotCategorical):
         return F.one_hot(label.reshape(distr.batch_shape).long(), distr.probs.shape[-1]).to(distr.probs.dtype)
@@ -194,66 +192,43 @@ def log_prob_sum(distr: Distribution, label: Tensor) -> Tensor:
 
     return reduce(distr.log_prob(label), 'b ... -> b', 'sum')
 
-# ------------------------------------------------------------------- objectives
+# objectives
+
+def _to_categorical(distr: Distribution) -> Distribution:
+    return distr._categorical if isinstance(distr, OneHotCategorical) else distr
+
+def _leaf_kl(student_distr: Distribution, teacher_distr: Distribution, reverse: bool) -> Tensor:
+    p, q = (student_distr, teacher_distr) if reverse else (teacher_distr, student_distr)
+    return reduce(kl_divergence(_to_categorical(p), _to_categorical(q)), 'b ... -> b', 'sum')
 
 def nll_loss(student_out, teacher_out = None, label = None, info = None) -> Tensor:
     """Per-sample negative log-likelihood of the teacher's action under the
-    student, summed over every head - the default objective, a straight
-    hard-label imitation. `student_out` / `label` are pytrees of matching
-    structure."""
+    student, summed over every head."""
 
     head_losses = pytree.tree_map(lambda distr, target: -log_prob_sum(distr, to_log_prob_target(target, distr)), student_out, label)
     return sum(pytree.tree_leaves(head_losses))
 
-def _leaf_kl(student_distr, teacher_distr, reverse):
-    discrete = (Categorical, OneHotCategorical, Bernoulli)
-
-    if isinstance(student_distr, discrete) and isinstance(teacher_distr, discrete):
-        # stable KL - the gradient q - p is computed from logits, not probabilities
-
-        if isinstance(student_distr, Bernoulli):
-            kl = bernoulli_kl(student_distr.logits, teacher_distr.logits) if reverse \
-                else bernoulli_kl(teacher_distr.logits, student_distr.logits)
-        else:
-            kl = categorical_kl(student_distr.logits, teacher_distr.logits) if reverse \
-                else categorical_kl(teacher_distr.logits, student_distr.logits)
-    else:
-        kl = kl_divergence(student_distr, teacher_distr) if reverse \
-            else kl_divergence(teacher_distr, student_distr)
-
-    return reduce(kl, 'b ... -> b', 'sum')
-
 def kl_loss(student_out, teacher_out = None, label = None, info = None, *, reverse = False) -> Tensor:
     """Per-sample KL between the two policies, summed over every head - soft
-    distillation. The default direction is KL(teacher || student)
-    (mode-covering); `reverse` flips it to KL(student || teacher). Falls back
-    to the nll on `label` when only actions are around (e.g. when the teacher
-    hands back raw actions)."""
+    distillation. Default is KL(teacher || student); `reverse` flips to
+    KL(student || teacher). Falls back to nll when only actions are present."""
 
     if not exists(teacher_out):
         return nll_loss(student_out, teacher_out, label, info)
 
-    head_losses = pytree.tree_map(lambda student_distr, teacher_distr: _leaf_kl(student_distr, teacher_distr, reverse), student_out, teacher_out)
+    head_losses = pytree.tree_map(lambda s, t: _leaf_kl(s, t, reverse), student_out, teacher_out)
     return sum(pytree.tree_leaves(head_losses))
 
 def mse_loss(student_out, teacher_out = None, label = None, info = None) -> Tensor:
     """Per-sample squared error between the two policies' mean actions, summed
-    over every head - deterministic distillation, no noise from the teacher's
-    stddev."""
+    over every head."""
 
-    if exists(teacher_out):
-        head_losses = pytree.tree_map(
-            lambda student_distr, teacher_distr: reduce((student_distr.mean - teacher_distr.mean.detach()).pow(2), 'b ... -> b', 'mean'),
-            student_out,
-            teacher_out
-        )
-    else:
-        head_losses = pytree.tree_map(
-            lambda student_distr, target: reduce((student_distr.mean - target.detach()).pow(2), 'b ... -> b', 'mean'),
-            student_out,
-            label
-        )
-
+    targets = pytree.tree_map(lambda d: d.mean, teacher_out) if exists(teacher_out) else label
+    head_losses = pytree.tree_map(
+        lambda distr, target: reduce(F.mse_loss(distr.mean, target.detach(), reduction = 'none'), 'b ... -> b', 'mean'),
+        student_out,
+        targets
+    )
     return sum(pytree.tree_leaves(head_losses))
 
 # kl / mse need the teacher's distribution - the loop re-evaluates it at fit time
@@ -262,13 +237,16 @@ def uses_teacher_out(loss_fn) -> bool:
     fn = loss_fn.func if isinstance(loss_fn, partial) else loss_fn
     return fn in (kl_loss, mse_loss)
 
-# --------------------------------------------------------------- alignment (repa)
+# alignment (repa)
 
-LossBreakdown = namedtuple('LossBreakdown', ['loss', 'policy', 'entropy', 'alignment'])
+class LossBreakdown(NamedTuple):
+    loss: Tensor
+    policy: Tensor
+    entropy: Tensor | None = None
+    alignment: Tensor | None = None
 
 def cosine_rep_loss(student_rep: Tensor, teacher_rep: Tensor) -> Tensor:
-    """Per-sample 1 - cosine similarity between aligned representations - the
-    default representation-alignment objective."""
+    """Per-sample 1 - cosine similarity between aligned representations."""
 
     return reduce(1. - F.cosine_similarity(student_rep, teacher_rep, dim = -1), 'b ... -> b', 'mean')
 
@@ -287,22 +265,62 @@ class CaptureActivation:
         return value
 
 def resolve_layer(model, layer, source = 'student') -> nn.Module:
-    """A module, or a submodule name resolved against the model - validated at
-    init, so a typo fails loudly instead of silently never firing."""
+    """A module, or a submodule name resolved against the model."""
 
     assert isinstance(layer, (str, nn.Module)), f'{source}_layer must be an nn.Module or a submodule name'
 
     if isinstance(layer, str):
-        name = layer
-        assert isinstance(model, nn.Module), f'cannot resolve {source}_layer {name!r} - the {source} is not an nn.Module'
+        assert isinstance(model, nn.Module), f'cannot resolve {source}_layer {layer!r} - the {source} is not an nn.Module'
         try:
-            return model.get_submodule(name)
+            return model.get_submodule(layer)
         except AttributeError:
-            raise ValueError(f'{source}_layer {name!r} not found in the {source}')
+            raise ValueError(f'{source}_layer {layer!r} not found in the {source}')
 
     return layer
 
-# ------------------------------------------------------------------- distiller
+# pytree ring buffer
+
+class _TreeBuffer:
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = capacity
+        self.device = device
+        self.leaves = None
+        self.treedef = None
+
+    def write(self, tree, idx: Tensor):
+        leaves, treedef = pytree.tree_flatten(tree)
+
+        if not exists(self.leaves):
+            self.treedef = treedef
+            self.leaves = [
+                torch.zeros(
+                    self.capacity,
+                    *leaf.shape[1:],
+                    dtype = torch.float32 if leaf.is_floating_point() else leaf.dtype,
+                    device = self.device
+                )
+                for leaf in leaves
+            ]
+
+        for buf, leaf in zip(self.leaves, leaves):
+            buf[idx] = leaf.detach().to(device = self.device, dtype = buf.dtype)
+
+    def get(self, idx: Tensor):
+        if not exists(self.leaves):
+            return None
+
+        return pytree.tree_unflatten([buf[idx] for buf in self.leaves], self.treedef)
+
+    def finite_mask(self, n: int) -> Tensor:
+        mask = torch.ones(n, dtype = torch.bool, device = self.device)
+
+        for buf in self.leaves:
+            if buf.is_floating_point():
+                mask &= reduce(torch.isfinite(buf[:n]), 'n ... -> n', 'all')
+
+        return mask
+
+# distiller
 
 class DaggerDistiller:
     """Student + teacher -> `(distill loss, student out)`.
@@ -312,10 +330,7 @@ class DaggerDistiller:
     `.backward()` and the optimizer. With an env (+ optimizer) the same object
     runs the whole DAgger loop itself - `collect` rolls the student out and
     labels every visited state, `train` fits the student on the labelled
-    buffer, `step` does both. Composite policies need nothing new:
-
-        distiller = DaggerDistiller(student, teacher)   # or a pytree of heads
-        distill_loss, student_out = distiller(states)"""
+    buffer, `step` does both."""
 
     def __init__(
         self,
@@ -382,7 +397,7 @@ class DaggerDistiller:
         self.buffer_teacher_input = self.needs_teacher_out and (exists(teacher_obs_fn) or exists(teacher_state_fn))
         self.teacher_sample = teacher_sample
 
-        # representation alignment - resolve the hooked layers up front
+        # representation alignment - resolve hooked layers up front
 
         self.student_capture = CaptureActivation(resolve_layer(student, student_layer)) if exists(student_layer) else None
         self.teacher_capture = CaptureActivation(resolve_layer(teacher, teacher_layer, 'teacher')) if exists(teacher_layer) else None
@@ -400,19 +415,12 @@ class DaggerDistiller:
         self.action_to_env_fn = action_to_env_fn
 
         self.kind = None if action_kind == 'auto' else action_kind
-
         self.optimizer = optimizer if exists(optimizer) else (torch.optim.Adam(params, lr = lr) if exists(params) else None)
 
         # device - explicit, else the optimizer's, else leave tensors alone (env-free)
 
-        self.device = torch.device(device) if exists(device) else None
-
-        if not exists(self.device) and exists(self.optimizer):
-            for group in self.optimizer.param_groups:
-                if len(group['params']) > 0:
-                    self.device = group['params'][0].device
-                    break
-
+        opt_params = self._params()
+        self.device = torch.device(device) if exists(device) else (opt_params[0].device if opt_params else None)
         self.buffer_device = default(self.device, torch.device('cpu'))
 
         self.buffer_size = buffer_size
@@ -424,38 +432,43 @@ class DaggerDistiller:
         self.num_envs = int(getattr(env, 'num_envs', 1)) if exists(env) else 0
         self.episode_steps = np.zeros(self.num_envs, dtype = np.int64)
 
-        self.state_buffers = None
-        self.state_treedef = None
-        self.teacher_input_buffers = None
-        self.teacher_input_treedef = None
-        self.action_buffers = None
-        self.action_treedef = None
-        self.rep_buffer = None
+        self._state_buf = _TreeBuffer(buffer_size, self.buffer_device)
+        self._action_buf = _TreeBuffer(buffer_size, self.buffer_device)
+        self._teacher_input_buf = _TreeBuffer(buffer_size, self.buffer_device)
+        self._rep_buf = _TreeBuffer(buffer_size, self.buffer_device)
         self.count = 0
 
         self._last_obs = None
         self._last_info = {}
 
-    # ------------------------------------------------------------------ helpers
+    @property
+    def state_buffers(self):
+        return self._state_buf.leaves
 
-    def _as_tensor(self, value):
-        if isinstance(value, dict):
-            return {key: self._as_tensor(nested) for key, nested in value.items()}
+    @property
+    def action_buffers(self):
+        return self._action_buf.leaves
 
-        if is_tensor(value):
-            return value.to(self.device) if exists(self.device) else value
+    @property
+    def teacher_input_buffers(self):
+        return self._teacher_input_buf.leaves
 
-        return cast_tensor(value, dtype = torch.float32, device = self.device)
+    @property
+    def rep_buffer(self):
+        return self._rep_buf.leaves[0] if exists(self._rep_buf.leaves) else None
+
+    # helpers
 
     def _to_torch(self, obs):
-        """A dict observation (gym `Dict` spaces, privileged fields) keeps its
-        fields - each leaf lands as a tensor on the device, so the view
-        callables read it the same way however the env returned it."""
-
         if exists(self.state_to_torch_fn):
             obs = self.state_to_torch_fn(obs)
 
-        return self._as_tensor(obs)
+        def convert(value):
+            if is_tensor(value):
+                return value.to(self.device) if exists(self.device) else value
+            return cast_tensor(value, dtype = torch.float32, device = self.device)
+
+        return pytree.tree_map(convert, obs)
 
     def _resolve_kind(self, policy_out, source = 'student'):
         kind = policy_kind(policy_out)
@@ -465,12 +478,15 @@ class DaggerDistiller:
 
         self.kind = kind
 
-    # -------------------------------------------------------------- teacher labels
+    def _params(self):
+        if not exists(self.optimizer):
+            return []
+
+        return [p for group in self.optimizer.param_groups for p in group['params']]
+
+    # teacher labels
 
     def _teacher_input(self, obs, state, info, step):
-        # the teacher reads the raw observation (teacher_obs_fn - privileged
-        # fields and all), or refines the student's state (teacher_state_fn)
-
         if exists(self.teacher_obs_fn):
             return self.teacher_obs_fn(obs, info, step)
 
@@ -478,15 +494,7 @@ class DaggerDistiller:
 
     @torch.no_grad()
     def _teacher_label(self, teacher_input, state, info, step):
-        """`(action, teacher_out)` - the teacher never learns, so it is
-        evaluated without autograd, and its distributions are kept around for
-        soft objectives. A teacher handing over raw actions is fine too."""
-
-        if exists(self.teacher_action_fn):
-            action = self.teacher_action_fn(teacher_input, info, step)
-        else:
-            action = self.teacher(teacher_input)
-
+        action = self.teacher_action_fn(teacher_input, info, step) if exists(self.teacher_action_fn) else self.teacher(teacher_input)
         teacher_out = None
 
         if is_policy_out(action):
@@ -510,35 +518,32 @@ class DaggerDistiller:
 
         return out if is_policy_out(out) else None
 
-    # --------------------------------------------------------------------- loss
+    # loss
 
     def _leaf_nll(self, student_distr: Distribution, label: Tensor) -> Tensor:
-        # per-head nll - non-finite rows parked on the student's mean, a fully unusable head is a nan loss
+        # per-head nll - non-finite rows parked on the student's mean
 
         target = to_log_prob_target(label, student_distr)
-        parking = None
+        finite = None
 
         if target.is_floating_point():
-            finite = reduce(torch.isfinite(target), 'b ... -> b', 'all')
+            mask = reduce(torch.isfinite(target), 'b ... -> b', 'all')
 
-            if not finite.all():
-                if not finite.any():
+            if not mask.all():
+                if not mask.any():
                     return student_distr.mean.sum() * float('nan')
 
-                parking = finite
+                finite = mask
                 target = target.clone()
-                target[~parking] = student_distr.mean[~parking].detach()
+                target[~finite] = student_distr.mean[~finite].detach()
 
         nll = -log_prob_sum(student_distr, target)
-        return masked_mean(nll, parking) if exists(parking) else nll.mean()
+        return masked_mean(nll, finite) if exists(finite) else nll.mean()
 
     def _policy_loss(self, student_out, label, teacher_out = None, info = None) -> Tensor:
         if exists(self.loss_fn):
-            # research objective - per-sample losses, non-finite rows masked out
             loss = self.loss_fn(student_out, teacher_out, label, info)
             return masked_loss_mean(loss) if loss.dim() > 0 else loss
-
-        # default - teacher-action nll, summed over heads
 
         head_losses = pytree.tree_map(self._leaf_nll, student_out, label)
         return sum(pytree.tree_leaves(head_losses))
@@ -559,33 +564,24 @@ class DaggerDistiller:
     def _loss(self, student_out, label, teacher_out = None, info = None, teacher_rep = None) -> LossBreakdown:
         policy = self._policy_loss(student_out, label, teacher_out, info)
         total = policy
-
-        entropy = None
+        entropy = alignment = None
 
         if self.entropy_weight > 0.:
             entropy = sum(reduce(distr.entropy(), 'b ... -> b', 'sum').mean() for distr in pytree.tree_leaves(student_out))
             total = total - self.entropy_weight * entropy
 
-        alignment = None
-
         if exists(self.student_capture):
             assert exists(teacher_rep), 'alignment has no teacher representation - the teacher layer must fire'
-
-            student_rep = self._pop(self.student_capture, 'student')
-            alignment = self._alignment_loss(student_rep, teacher_rep)
+            alignment = self._alignment_loss(self._pop(self.student_capture, 'student'), teacher_rep)
             total = total + self.rep_align_weight * alignment
 
         return LossBreakdown(total, policy, entropy, alignment)
 
-    # ------------------------------------------------------------------- env-free
+    # env-free
 
     def __call__(self, state, teacher_state = None, *, info = None, step = 0, return_loss_breakdown = False) -> tuple[Tensor, Distribution]:
-        """Distill one batch of data directly - no env involved. The teacher
-        labels `state`, and back comes `(distill_loss, student_out)`;
-        differentiable, so the caller owns `.backward()` and the optimizer.
-        Pass the teacher's own data as `teacher_state` to skip the teacher's
-        view; ask for `return_loss_breakdown` to get the loss components
-        instead of just the total."""
+        """Distill one batch directly - no env involved. Returns
+        `(distill_loss, student_out)` (or `(LossBreakdown, student_out)`)."""
 
         info = default(info, {})
 
@@ -596,7 +592,6 @@ class DaggerDistiller:
         self._resolve_kind(student_out)
 
         teacher_input = self._to_torch(teacher_state) if exists(teacher_state) else self._teacher_input(obs, state, info, step)
-
         label, teacher_out = self._teacher_label(teacher_input, state, info, step)
 
         teacher_rep = self._pop(self.teacher_capture, 'teacher') if exists(self.teacher_capture) else None
@@ -604,7 +599,7 @@ class DaggerDistiller:
 
         return (breakdown, student_out) if return_loss_breakdown else (breakdown.loss, student_out)
 
-    # -------------------------------------------------------------------- rollout
+    # rollout & buffer
 
     @torch.no_grad()
     def collect(self, steps: int, sample = True, teacher_acts = False) -> dict:
@@ -642,86 +637,46 @@ class DaggerDistiller:
         student_out = self.student(state)
         self._resolve_kind(student_out)
 
-        # the teacher reads the raw observation, or refines the student's state
-
         teacher_input = self._teacher_input(obs, state, info, step)
         label, _ = self._teacher_label(teacher_input, state, info, step)
 
         teacher_rep = self._pop(self.teacher_capture, 'teacher') if exists(self.teacher_capture) else None
-        buffered_teacher_input = teacher_input if self.buffer_teacher_input else None
-        self._write(state, label, teacher_rep = teacher_rep, teacher_input = buffered_teacher_input)
+        self._write(state, label, teacher_rep = teacher_rep, teacher_input = teacher_input if self.buffer_teacher_input else None)
 
         actions = label if teacher_acts else best_action(student_out, sample = sample)
 
         if exists(self.action_to_env_fn):
             actions = self.action_to_env_fn(actions)
 
-        if exists(self.env_step_fn):
-            obs, _, term, trunc, step_info = self.env_step_fn(actions)
-        else:
-            obs, _, term, trunc, step_info = self.env.step(actions)
+        step_fn = default(self.env_step_fn, self.env.step)
+        obs, _, term, trunc, step_info = step_fn(actions)
 
         self._last_obs = obs
         self._last_info = dict(step_info) if isinstance(step_info, dict) else {}
 
-        done = rearrange(np.asarray(term), '... -> (...)').astype(bool) \
-            | rearrange(np.asarray(trunc), '... -> (...)').astype(bool)
-
+        done = np.asarray(term, dtype = bool).reshape(-1) | np.asarray(trunc, dtype = bool).reshape(-1)
         self.episode_steps += 1
         self.episode_steps[done] = 0
 
-    # --------------------------------------------------------------------- buffer
-
-    def _init_buffers(self, tree):
-        leaves, treedef = pytree.tree_flatten(tree)
-        buffers = [
-            torch.zeros(
-                self.buffer_size,
-                *leaf.shape[1:],
-                dtype = torch.float32 if leaf.is_floating_point() else leaf.dtype,
-                device = self.buffer_device
-            )
-            for leaf in leaves
-        ]
-        return buffers, treedef
-
-    def _write_tree(self, buffers, tree, idx):
-        for buffer, leaf in zip(buffers, pytree.tree_leaves(tree)):
-            buffer[idx] = leaf.detach().to(buffer.dtype)
-
     def _write(self, state, target, teacher_rep: Tensor | None = None, teacher_input = None):
-        # one buffer per state / action leaf, so a dict observation fits too -
-        # each leaf keeps its dtype, floating point in fp32
-
         n = pytree.tree_leaves(state)[0].shape[0]
         idx = (self.count + torch.arange(n, device = self.buffer_device)) % self.buffer_size
 
-        if not exists(self.state_buffers):
-            self.state_buffers, self.state_treedef = self._init_buffers(state)
-            self.action_buffers, self.action_treedef = self._init_buffers(target)
-
-        self._write_tree(self.state_buffers, state, idx)
-        self._write_tree(self.action_buffers, target, idx)
+        self._state_buf.write(state, idx)
+        self._action_buf.write(target, idx)
 
         if exists(teacher_input):
-            if not exists(self.teacher_input_buffers):
-                self.teacher_input_buffers, self.teacher_input_treedef = self._init_buffers(teacher_input)
-
-            self._write_tree(self.teacher_input_buffers, teacher_input, idx)
+            self._teacher_input_buf.write(teacher_input, idx)
 
         if exists(teacher_rep):
-            if not exists(self.rep_buffer):
-                self.rep_buffer = torch.zeros(self.buffer_size, *teacher_rep.shape[1:], dtype = torch.float32, device = self.buffer_device)
-
-            self.rep_buffer[idx] = teacher_rep.detach().float()
+            self._rep_buf.write(teacher_rep, idx)
 
         self.count += n
 
-    # ---------------------------------------------------------------------- train
+    # train
 
     def train(self, epochs = None, batch_size = None, max_samples = None, return_loss_breakdown = False) -> dict:
-        """Supervised fit of the student on the labelled buffer - the same loss
-        as the env-free wrapper, non-finite batches skipped, gradients clipped."""
+        """Supervised fit of the student on the labelled buffer."""
 
         epochs = default(epochs, self.epochs)
         batch_size = default(batch_size, self.batch_size)
@@ -730,95 +685,66 @@ class DaggerDistiller:
         loss_val, last_breakdown = float('nan'), None
         n = min(self.count, self.buffer_size)
 
-        if exists(self.optimizer) and n > 0:
-            def take(leaves, idx):
-                return [leaf[idx] for leaf in leaves] if exists(leaves) else None
+        if not exists(self.optimizer) or n == 0:
+            stats = dict(loss = loss_val, samples = n)
+            return {**stats, 'loss_breakdown': last_breakdown} if return_loss_breakdown else stats
 
-            def batch(leaves, treedef, idx):
-                return pytree.tree_unflatten([leaf[idx] for leaf in leaves], treedef)
+        indices = torch.arange(n, device = self.buffer_device)
 
-            state_leaves = take(self.state_buffers, slice(0, n))
-            teacher_input_leaves = take(self.teacher_input_buffers, slice(0, n))
-            action_leaves = take(self.action_buffers, slice(0, n))
-            reps = self.rep_buffer[:n] if exists(self.rep_buffer) else None
+        # default nll validates targets - drop non-finite labels (a custom loss_fn owns its own)
 
-            # default nll validates targets - drop non-finite labels (a custom loss_fn owns its own)
+        if not exists(self.loss_fn):
+            indices = indices[self._action_buf.finite_mask(n)]
 
-            if not exists(self.loss_fn):
-                finite = torch.ones(n, dtype = torch.bool, device = self.buffer_device)
+        if exists(max_samples) and indices.numel() > max_samples:
+            indices = indices[torch.randperm(indices.numel(), device = self.buffer_device)[:max_samples]]
 
-                for leaf in action_leaves:
-                    if leaf.is_floating_point():
-                        finite &= reduce(torch.isfinite(leaf), 'n ... -> n', 'all')
+        n = indices.numel()
+        params = self._params()
 
-                if not finite.all():
-                    state_leaves = take(state_leaves, finite)
-                    teacher_input_leaves = take(teacher_input_leaves, finite)
-                    action_leaves = take(action_leaves, finite)
-                    reps = reps[finite] if exists(reps) else None
-                    n = state_leaves[0].shape[0]
+        for _ in range(max(1, epochs)):
+            perm = indices[torch.randperm(n, device = self.buffer_device)]
 
-            if exists(max_samples) and n > max_samples:
-                sel = torch.randperm(n, device = self.buffer_device)[:max_samples]
-                state_leaves = take(state_leaves, sel)
-                teacher_input_leaves = take(teacher_input_leaves, sel)
-                action_leaves = take(action_leaves, sel)
-                reps = reps[sel] if exists(reps) else None
-                n = max_samples
+            for idx in perm.split(batch_size):
+                states = self._state_buf.get(idx)
+                label = self._action_buf.get(idx)
+                student_out = self.student(states)
 
-            for _ in range(max(1, epochs)):
-                perm = torch.randperm(n, device = self.buffer_device)
+                teacher_out = None
+                if self.needs_teacher_out:
+                    teacher_inputs = default(self._teacher_input_buf.get(idx), states)
+                    teacher_out = self._teacher_distribution(teacher_inputs)
 
-                for i in range(0, n, batch_size):
-                    b = perm[i:i + batch_size]
-                    states = batch(state_leaves, self.state_treedef, b)
-                    label = batch(action_leaves, self.action_treedef, b)
+                breakdown = self._loss(student_out, label, teacher_out = teacher_out, teacher_rep = self._rep_buf.get(idx))
+                loss = breakdown.loss
 
-                    student_out = self.student(states)
-                    teacher_out = None
+                # beta nll gradients spike - skip bad batches, clip the rest
 
-                    if self.needs_teacher_out:
-                        teacher_inputs = batch(teacher_input_leaves, self.teacher_input_treedef, b) if exists(teacher_input_leaves) else states
-                        teacher_out = self._teacher_distribution(teacher_inputs)
+                self.optimizer.zero_grad(set_to_none = True)
 
-                    breakdown = self._loss(student_out, label, teacher_out = teacher_out, teacher_rep = reps[b] if exists(reps) else None)
-                    loss = breakdown.loss
+                if not torch.isfinite(loss):
+                    continue
 
-                    # beta nll gradients spike - skip bad batches, clip the rest
+                loss.backward()
 
-                    self.optimizer.zero_grad(set_to_none = True)
+                if exists(self.max_grad_norm):
+                    torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
 
-                    if not torch.isfinite(loss):
-                        continue
-
-                    loss.backward()
-
-                    if exists(self.max_grad_norm):
-                        torch.nn.utils.clip_grad_norm_(self._params(), self.max_grad_norm)
-
-                    if all((p.grad is None) or torch.isfinite(p.grad).all() for p in self._params()):
-                        self.optimizer.step()
-                        loss_val, last_breakdown = float(loss.detach()), breakdown
+                if all(p.grad is None or torch.isfinite(p.grad).all() for p in params):
+                    self.optimizer.step()
+                    loss_val, last_breakdown = float(loss.detach()), breakdown
 
         stats = dict(loss = loss_val, samples = n)
-
         return {**stats, 'loss_breakdown': last_breakdown} if return_loss_breakdown else stats
-
-    def _params(self):
-        if not exists(self.optimizer):
-            return []
-
-        return [p for group in self.optimizer.param_groups for p in group['params']]
 
     def step(self, collect_steps: int, epochs = None, sample = True, return_loss_breakdown = False) -> dict:
         """One full DAgger round: roll the student, label with the teacher, fit."""
 
         return {**self.collect(collect_steps, sample = sample), **self.train(epochs = epochs, return_loss_breakdown = return_loss_breakdown)}
 
-# ------------------------------------------------------------------------ demo
+# demo
 
 if __name__ == '__main__':
-    import torch.nn as nn
     from torch.distributions import Bernoulli, Normal
 
     torch.manual_seed(0)

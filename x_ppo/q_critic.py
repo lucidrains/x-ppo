@@ -31,11 +31,11 @@ from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
-from einops import repeat
-from torch import Tensor, arange, as_tensor, cat, is_tensor
+from einops import rearrange, repeat
+from torch import Tensor, arange, as_tensor, cat
 from torch.distributions import Normal
 from torch.nn import Embedding, LayerNorm, Linear, Module, Sequential, SiLU
-from torch_einops_utils import masked_mean
+from torch_einops_utils import categorical_kl, masked_mean, pad_right_ndim_to
 
 # helpers
 
@@ -159,9 +159,9 @@ class NextLatentQCritic(Module):
         self.to_done = Linear(hidden_dim, 1)
 
         if exists(action_horizons):
-            horizons_t = as_tensor(action_horizons, dtype = torch.float32)
-            assert bool((horizons_t >= 1.).all()), 'action_horizons must all be >= 1'
-            self.register_buffer('action_horizons', horizons_t, persistent = False)
+            horizons = as_tensor(action_horizons, dtype = torch.float32)
+            assert bool((horizons >= 1.).all()), 'action_horizons must all be >= 1'
+            self.register_buffer('action_horizons', horizons, persistent = False)
             self.to_duration = Linear(hidden_dim, 1)
         else:
             self.register_buffer('action_horizons', None, persistent = False)
@@ -169,7 +169,7 @@ class NextLatentQCritic(Module):
 
         self.to_next_latent_logvar = Linear(hidden_dim, dim_embed) if probabilistic_next_latent else None
 
-        # start the dynamics as an identity, and predicted option duration near nominal horizon
+        # start dynamics at identity and predicted option duration near nominal horizon
 
         with torch.no_grad():
             self.to_next_latent_and_q.weight[:dim_embed].zero_()
@@ -185,15 +185,11 @@ class NextLatentQCritic(Module):
 
     def _align_gamma(self, ref: Tensor) -> Tensor:
         gamma = as_tensor(self.gamma, device = ref.device, dtype = ref.dtype)
-        while gamma.ndim < ref.ndim:
-            gamma = gamma[..., None]
-        return gamma
+        return pad_right_ndim_to(gamma, ref.ndim)
 
     def _discount_factor(self, ref: Tensor, durations: Tensor | None = None) -> Tensor:
         gamma = self._align_gamma(ref)
-        if not exists(durations):
-            return gamma
-        return gamma ** durations.to(device = ref.device, dtype = ref.dtype)
+        return gamma ** durations.to(device = ref.device, dtype = ref.dtype) if exists(durations) else gamma
 
     def _discounted_duration(self, ref: Tensor, durations: Tensor) -> Tensor:
         gamma = self._align_gamma(ref)
@@ -203,16 +199,12 @@ class NextLatentQCritic(Module):
         return torch.where((1. - gamma).abs() < 1e-6, durs, -torch.expm1(durs * log_g) / denom.clamp_min(1e-12))
 
     def _nominal_horizons(self, actions: Tensor, dtype: torch.dtype) -> Tensor:
-        horizon_idx = actions.long() if self.discrete_actions else actions[..., 0].long()
-        return self.action_horizons[horizon_idx].to(dtype = dtype)
+        idx = actions.long() if self.discrete_actions else actions[..., 0].long()
+        return self.action_horizons[idx].to(dtype = dtype)
 
     def forward_value(self, embeddings: Tensor) -> Tensor:
         values = self.value_net(embeddings)
-
-        if values.ndim == embeddings.ndim and values.shape[-1] == 1:
-            values = values.squeeze(-1)
-
-        return values
+        return values.squeeze(-1) if values.ndim == embeddings.ndim and values.shape[-1] == 1 else values
 
     def _heads(
         self,
@@ -221,8 +213,7 @@ class NextLatentQCritic(Module):
         sample_next_latent: bool = True
     ) -> QHeads:
         act_emb = self.action_embed(actions.long() if self.discrete_actions else actions)
-        cond = cat((embeddings, act_emb), dim = -1)
-        hidden = self.net(cond)
+        hidden = self.net(cat((embeddings, act_emb), dim = -1))
 
         next_latent_and_q = self.to_next_latent_and_q(hidden)
         next_latent_mean = embeddings + next_latent_and_q[..., :self.dim_embed]
@@ -238,14 +229,14 @@ class NextLatentQCritic(Module):
             if sample_next_latent:
                 next_latent = next_latent_mean + next_latent_std * torch.randn_like(next_latent_mean)
 
-        pred_rewards = self.to_reward(hidden)[..., 0]
-        done_logits = self.to_done(hidden)[..., 0]
+        pred_rewards = self.to_reward(hidden).squeeze(-1)
+        done_logits = self.to_done(hidden).squeeze(-1)
         pred_dones = done_logits.sigmoid()
 
         pred_durations = None
         if exists(self.to_duration) and exists(self.action_horizons):
             nom_h = self._nominal_horizons(actions, embeddings.dtype)
-            pred_durations = 1. + (nom_h - 1.) * self.to_duration(hidden)[..., 0].sigmoid()
+            pred_durations = 1. + (nom_h - 1.) * self.to_duration(hidden).squeeze(-1).sigmoid()
 
         return QHeads(
             next_latent = next_latent,
@@ -258,11 +249,7 @@ class NextLatentQCritic(Module):
             pred_durations = pred_durations
         )
 
-    def _model_q_from_heads(
-        self,
-        heads: QHeads,
-        durations: Tensor | None = None
-    ) -> Tensor:
+    def _model_q_from_heads(self, heads: QHeads, durations: Tensor | None = None) -> Tensor:
         eff_dur = default(durations, heads.pred_durations)
         step_gamma = self._discount_factor(heads.pred_rewards, eff_dur)
         return heads.pred_rewards + step_gamma * (1. - heads.pred_dones) * self.forward_value(heads.next_latent)
@@ -279,17 +266,67 @@ class NextLatentQCritic(Module):
         q_model = self._model_q_from_heads(heads, durations)
         return heads.q_values - (2. * conservative_weight) * (heads.q_values - q_model).clamp_min(0.)
 
+    def _advantage_from_heads(
+        self,
+        heads: QHeads,
+        values: Tensor,
+        durations: Tensor | None = None,
+        rate_advantage: bool = False,
+        conservative_weight: float = 0.
+    ) -> Tensor:
+        eff_dur = default(durations, heads.pred_durations)
+        adv = self._effective_q_from_heads(heads, conservative_weight, eff_dur) - values
+
+        if rate_advantage and exists(eff_dur):
+            disc_dur = self._discounted_duration(adv, eff_dur)
+            return torch.where(adv > 0., adv / disc_dur, adv)
+
+        return adv
+
+    def _bootstrap_target_q(
+        self,
+        heads: QHeads,
+        rewards: Tensor | None,
+        next_values: Tensor | None,
+        masks: Tensor | None,
+        dones: Tensor | None,
+        durations: Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype
+    ) -> Tensor:
+        target_reward = rewards if exists(rewards) else heads.pred_rewards.detach()
+
+        if exists(dones):
+            continuation = default(masks, 1.) * (~dones.bool()).to(dtype)
+        elif exists(masks):
+            continuation = masks
+        else:
+            continuation = 1. - heads.pred_dones.detach()
+
+        eff_dur = default(durations, heads.pred_durations.detach() if exists(heads.pred_durations) else None)
+        step_gamma = self._discount_factor(target_reward, eff_dur)
+
+        # bootstrap from supplied values when available, else the predicted next latent
+
+        if exists(next_values):
+            bootstrap = as_tensor(next_values, device = device, dtype = dtype)
+
+            if bootstrap.ndim == target_reward.ndim - 1:
+                bootstrap = rearrange(bootstrap, '... -> ... 1')
+            elif bootstrap.ndim == target_reward.ndim + 1 and bootstrap.shape[-1] == 1:
+                bootstrap = bootstrap.squeeze(-1)
+        else:
+            bootstrap = self.forward_value(heads.next_latent)
+
+        return target_reward + step_gamma * continuation * bootstrap.detach()
+
+    # query accessors
+
     def q_values(self, embeddings: Tensor, actions: Tensor) -> Tensor:
         return self._heads(embeddings, actions, sample_next_latent = False).q_values
 
-    def model_q_values(
-        self,
-        embeddings: Tensor,
-        actions: Tensor,
-        durations: Tensor | None = None
-    ) -> Tensor:
-        heads = self._heads(embeddings, actions, sample_next_latent = False)
-        return self._model_q_from_heads(heads, durations)
+    def model_q_values(self, embeddings: Tensor, actions: Tensor, durations: Tensor | None = None) -> Tensor:
+        return self._model_q_from_heads(self._heads(embeddings, actions, sample_next_latent = False), durations)
 
     def conservative_q_values(
         self,
@@ -298,8 +335,11 @@ class NextLatentQCritic(Module):
         conservative_weight: float = 0.25,
         durations: Tensor | None = None
     ) -> Tensor:
-        heads = self._heads(embeddings, actions, sample_next_latent = False)
-        return self._effective_q_from_heads(heads, conservative_weight, durations)
+        return self._effective_q_from_heads(
+            self._heads(embeddings, actions, sample_next_latent = False),
+            conservative_weight,
+            durations
+        )
 
     def smdp_advantage_scores(
         self,
@@ -310,31 +350,18 @@ class NextLatentQCritic(Module):
         rate_advantage: bool = False,
         conservative_weight: float = 0.
     ) -> Tensor:
-        # supports embeddings of shape (..., d) against actions of shape (..., k) or (..., k, a)
+        # supports embeddings (..., d) against actions (..., k) or (..., k, a)
 
-        has_cand_dim = (
-            actions.ndim == embeddings.ndim if self.discrete_actions
-            else actions.ndim == embeddings.ndim + 1
-        )
+        has_cand_dim = actions.ndim == (embeddings.ndim if self.discrete_actions else embeddings.ndim + 1)
+        values = self.forward_value(embeddings)
 
         if has_cand_dim:
             num_candidates = actions.shape[-1] if self.discrete_actions else actions.shape[-2]
-            values = self.forward_value(embeddings)[..., None]
-            rep_embeddings = repeat(embeddings, '... d -> ... k d', k = num_candidates)
-        else:
-            values = self.forward_value(embeddings)
-            rep_embeddings = embeddings
+            values = rearrange(values, '... -> ... 1')
+            embeddings = repeat(embeddings, '... d -> ... k d', k = num_candidates)
 
-        heads = self._heads(rep_embeddings, actions, sample_next_latent = False)
-        eff_dur = default(durations, heads.pred_durations)
-        q_eff = self._effective_q_from_heads(heads, conservative_weight, eff_dur)
-        adv = q_eff - values
-
-        if rate_advantage and exists(eff_dur):
-            disc_dur = self._discounted_duration(adv, eff_dur)
-            return torch.where(adv > 0., adv / disc_dur, adv)
-
-        return adv
+        heads = self._heads(embeddings, actions, sample_next_latent = False)
+        return self._advantage_from_heads(heads, values, durations, rate_advantage, conservative_weight)
 
     def next_latents(self, embeddings: Tensor, actions: Tensor) -> Tensor:
         return self._heads(embeddings, actions, sample_next_latent = False).next_latent
@@ -358,6 +385,8 @@ class NextLatentQCritic(Module):
     def predicted_durations(self, embeddings: Tensor, actions: Tensor) -> Tensor | None:
         return self._heads(embeddings, actions, sample_next_latent = False).pred_durations
 
+    # training & action filtering
+
     def forward(
         self,
         embeddings: Tensor,
@@ -372,102 +401,52 @@ class NextLatentQCritic(Module):
         q_targets: Tensor | None = None,
         return_loss_breakdown: bool = False
     ):
-        dtype = embeddings.dtype
+        device, dtype = embeddings.device, embeddings.dtype
         zero = embeddings.new_zeros(())
 
         values = self.forward_value(embeddings)
-
         value_loss = q_loss = next_latent_loss = reward_loss = terminal_loss = duration_loss = zero
         q_values = None
 
         if exists(actions):
             heads = self._heads(embeddings, actions, sample_next_latent = self.training)
-            next_latent, q_values = heads.next_latent, heads.q_values
-            pred_rewards, pred_dones, done_logits = heads.pred_rewards, heads.pred_dones, heads.done_logits
+            q_values = heads.q_values
 
             if exists(next_embeddings):
                 next_embeddings = next_embeddings.detach()
 
                 if exists(heads.next_latent_std):
-                    next_latent_loss = masked_mean(
-                        F.gaussian_nll_loss(
-                            heads.next_latent_mean,
-                            next_embeddings,
-                            heads.next_latent_std.square().clamp_min(1e-6),
-                            reduction = 'none',
-                            eps = 1e-6
-                        ),
-                        mask = masks
+                    nll = F.gaussian_nll_loss(
+                        heads.next_latent_mean,
+                        next_embeddings,
+                        heads.next_latent_std.square().clamp_min(1e-6),
+                        reduction = 'none',
+                        eps = 1e-6
                     )
+                    next_latent_loss = masked_mean(nll, mask = masks)
                 else:
-                    next_latent_loss = masked_mean(
-                        F.smooth_l1_loss(next_latent, next_embeddings, reduction = 'none'),
-                        mask = masks
-                    )
+                    next_latent_loss = masked_mean(F.smooth_l1_loss(heads.next_latent, next_embeddings, reduction = 'none'), mask = masks)
 
             if exists(rewards):
-                reward_loss = masked_mean(
-                    F.smooth_l1_loss(pred_rewards, rewards, reduction = 'none'),
-                    mask = masks
-                )
+                reward_loss = masked_mean(F.smooth_l1_loss(heads.pred_rewards, rewards, reduction = 'none'), mask = masks)
 
             if exists(dones):
-                terminal_loss = masked_mean(
-                    F.binary_cross_entropy_with_logits(done_logits, dones.float(), reduction = 'none'),
-                    mask = masks
-                )
+                terminal_loss = masked_mean(F.binary_cross_entropy_with_logits(heads.done_logits, dones.float(), reduction = 'none'), mask = masks)
 
             if exists(durations) and exists(heads.pred_durations) and exists(self.action_horizons):
                 nom_h = self._nominal_horizons(actions, dtype).clamp_min(1.)
-                duration_loss = masked_mean(
-                    F.smooth_l1_loss(
-                        heads.pred_durations / nom_h,
-                        durations.to(device = embeddings.device, dtype = dtype) / nom_h,
-                        reduction = 'none'
-                    ),
-                    mask = masks
-                )
+                target_dur = durations.to(device = device, dtype = dtype)
+                duration_loss = masked_mean(F.smooth_l1_loss(heads.pred_durations / nom_h, target_dur / nom_h, reduction = 'none'), mask = masks)
 
             if exists(q_targets):
-                target_q = q_targets.to(device = embeddings.device, dtype = dtype).detach()
+                target_q = q_targets.to(device = device, dtype = dtype).detach()
             else:
-                target_reward = rewards if exists(rewards) else pred_rewards.detach()
+                target_q = self._bootstrap_target_q(heads, rewards, next_values, masks, dones, durations, device, dtype)
 
-                if exists(dones):
-                    continuation = default(masks, 1.) * (~dones.bool()).to(dtype)
-                elif exists(masks):
-                    continuation = masks
-                else:
-                    continuation = 1. - pred_dones.detach()
-
-                eff_dur = default(durations, heads.pred_durations.detach() if exists(heads.pred_durations) else None)
-                step_gamma = self._discount_factor(target_reward, eff_dur)
-
-                # bootstrap from supplied values when available, else the predicted latent
-
-                if exists(next_values):
-                    bootstrap_values = next_values if is_tensor(next_values) else as_tensor(next_values)
-                    bootstrap_values = bootstrap_values.to(device = embeddings.device, dtype = dtype)
-
-                    if bootstrap_values.ndim == target_reward.ndim - 1:
-                        bootstrap_values = bootstrap_values[..., None]
-                    elif bootstrap_values.ndim == target_reward.ndim + 1 and bootstrap_values.shape[-1] == 1:
-                        bootstrap_values = bootstrap_values[..., 0]
-                else:
-                    bootstrap_values = self.forward_value(next_latent)
-
-                target_q = target_reward + step_gamma * continuation * bootstrap_values.detach()
-
-            q_loss = masked_mean(
-                F.smooth_l1_loss(q_values, target_q, reduction = 'none'),
-                mask = masks
-            )
+            q_loss = masked_mean(F.smooth_l1_loss(q_values, target_q, reduction = 'none'), mask = masks)
 
         if exists(returns):
-            value_loss = masked_mean(
-                F.mse_loss(values, returns, reduction = 'none'),
-                mask = masks
-            )
+            value_loss = masked_mean(F.mse_loss(values, returns, reduction = 'none'), mask = masks)
 
         loss = (
             self.value_coef * value_loss +
@@ -506,84 +485,37 @@ class NextLatentQCritic(Module):
     ) -> FilteredActions:
         batch, num_candidates = candidate_actions.shape[:2]
 
-        raw_embeddings = embeddings[:, 0] if embeddings.ndim == 3 else embeddings
-
         if embeddings.ndim == 2:
+            raw_embeddings = embeddings
             rep_embeddings = repeat(embeddings, 'b d -> b k d', k = num_candidates)
-        elif embeddings.shape[1] == 1 and num_candidates > 1:
-            rep_embeddings = repeat(embeddings, 'b 1 d -> b k d', k = num_candidates)
         else:
-            rep_embeddings = embeddings
+            raw_embeddings = embeddings[:, 0]
+            rep_embeddings = embeddings.expand(-1, num_candidates, -1)
 
         heads = self._heads(rep_embeddings, candidate_actions, sample_next_latent = False)
-        q_values = heads.q_values
 
         if rate_advantage or conservative_weight > 0.:
-            eff_dur = default(durations, heads.pred_durations)
-            q_eff = self._effective_q_from_heads(heads, conservative_weight, eff_dur)
-            values = self.forward_value(raw_embeddings)[..., None]
-            adv = q_eff - values
-
-            if rate_advantage and exists(eff_dur):
-                disc_dur = self._discounted_duration(adv, eff_dur)
-                scores = torch.where(adv > 0., adv / disc_dur, adv)
-            else:
-                scores = adv
+            values = rearrange(self.forward_value(raw_embeddings), 'b -> b 1')
+            scores = self._advantage_from_heads(heads, values, durations, rate_advantage, conservative_weight)
         else:
-            scores = q_values
+            scores = heads.q_values
 
         masked_scores = scores.masked_fill(~candidate_mask.bool(), -torch.inf) if exists(candidate_mask) else scores
         indices = masked_scores.argmax(dim = -1)
 
         batch_indices = arange(batch, device = candidate_actions.device)
         actions = candidate_actions[batch_indices, indices]
-
-        log_probs = None
-        if exists(candidate_log_probs):
-            log_probs = candidate_log_probs[batch_indices, indices]
+        log_probs = candidate_log_probs[batch_indices, indices] if exists(candidate_log_probs) else None
 
         return FilteredActions(
             actions = actions,
             indices = indices,
-            q_values = q_values,
+            q_values = heads.q_values,
             log_probs = log_probs,
             scores = scores
         )
 
 # soft expert iteration
-
-def _softmax_with_mask(
-    q_values: Tensor,
-    mask: Tensor | None,
-    eps: float
-) -> Tensor:
-    if not exists(mask):
-        return q_values.softmax(dim = -1)
-
-    q_values = q_values.masked_fill(~mask, -torch.inf)
-    no_valid = ~mask.any(dim = -1)
-
-    weights = q_values.softmax(dim = -1)
-    weights = weights * mask
-    weights = weights / weights.sum(dim = -1, keepdim = True).clamp_min(eps)
-
-    # all-invalid rows fall back to uniform, the caller masks their loss
-
-    if no_valid.any():
-        uniform = torch.full_like(weights, 1. / weights.shape[-1])
-        weights = torch.where(no_valid[..., None], uniform, weights)
-
-    return weights
-
-def _candidate_kl(
-    q_values: Tensor,
-    log_beta: Tensor,
-    mask: Tensor | None,
-    log_num_candidates: Tensor,
-    eps: float
-) -> Tensor:
-    weights = _softmax_with_mask(q_values / log_beta.exp()[..., None], mask, eps)
-    return (weights * (weights.clamp_min(eps).log() + log_num_candidates[..., None])).sum(dim = -1)
 
 def soft_exit_weights(
     q_values: Tensor,                     # (..., k)
@@ -599,59 +531,50 @@ def soft_exit_weights(
     assert q_values.shape[-1] > 0, 'q_values must have at least one candidate'
 
     dtype, device = q_values.dtype, q_values.device
-    num_candidates = q_values.shape[-1]
-
     q_values = q_values.detach()
+    uniform = torch.zeros_like(q_values)
 
     if exists(mask):
         mask = mask.bool()
         assert mask.shape == q_values.shape, 'mask must match q_values'
-        q_values = q_values.masked_fill(~mask, -torch.inf)
+
+        # all-invalid rows fall back to uniform (zero kl); the caller masks their loss
+
+        no_valid = ~mask.any(dim = -1, keepdim = True)
+        valid = mask | no_valid
+        q_values = q_values.masked_fill(~valid, -torch.inf).masked_fill(no_valid, 0.)
+        uniform = uniform.masked_fill(~valid, -torch.inf)
 
     # center before dividing by beta
 
     max_q = q_values.max(dim = -1, keepdim = True).values
-    max_q = torch.where(torch.isfinite(max_q), max_q, torch.zeros_like(max_q))
-    q_values = q_values - max_q
-
-    if exists(mask):
-        valid_count = mask.sum(dim = -1).to(dtype)
-    else:
-        valid_count = torch.full(q_values.shape[:-1], num_candidates, device = device, dtype = dtype)
-
-    # all-invalid rows are uniform and contribute zero kl
-
-    valid_count_for_kl = torch.where(valid_count > 0, valid_count, torch.full_like(valid_count, num_candidates))
-    log_num_candidates = valid_count_for_kl.log()
+    q_values = q_values - torch.where(torch.isfinite(max_q), max_q, 0.)
 
     if exists(kl_budget):
-        target_kl = kl_budget if is_tensor(kl_budget) else as_tensor(kl_budget)
-        target_kl = target_kl.to(device = device, dtype = dtype).expand(q_values.shape[:-1])
-
+        target_kl = as_tensor(kl_budget, device = device, dtype = dtype).expand(q_values.shape[:-1])
         low = torch.full_like(target_kl, -20.)
         high = torch.full_like(target_kl, 20.)
 
         for _ in range(num_bisect_steps):
             mid = (low + high) * 0.5
-            kl_mid = _candidate_kl(q_values, mid, mask, log_num_candidates, eps)
-
-            too_high = kl_mid > target_kl
+            too_high = categorical_kl(q_values / rearrange(mid.exp(), '... -> ... 1'), uniform) > target_kl
             low = torch.where(too_high, mid, low)
             high = torch.where(too_high, high, mid)
 
-        log_beta = high
-        beta = log_beta.exp()
+        beta = high.exp()
     else:
         beta = as_tensor(beta, device = device, dtype = dtype).expand(q_values.shape[:-1])
         assert bool((beta > 0).all()), 'beta must be positive'
-        log_beta = beta.log()
 
-    weights = _softmax_with_mask(q_values / beta[..., None], mask, eps)
-    kl = _candidate_kl(q_values, log_beta, mask, log_num_candidates, eps)
+    scaled = q_values / rearrange(beta, '... -> ... 1')
+    weights = scaled.softmax(dim = -1)
+
+    if not return_stats:
+        return weights
+
+    kl = categorical_kl(scaled, uniform)
     ess = 1. / weights.square().sum(dim = -1).clamp_min(eps)
-
-    stats = SoftExitStats(weights = weights, beta = beta, kl = kl, ess = ess)
-    return (weights, stats) if return_stats else weights
+    return weights, SoftExitStats(weights = weights, beta = beta, kl = kl, ess = ess)
 
 def soft_exit_loss(
     candidate_log_probs: Tensor,          # (..., k) - sum action dims before passing
@@ -667,10 +590,6 @@ def soft_exit_loss(
 ) -> Tensor | tuple[Tensor, SoftExitStats]:
     assert candidate_log_probs.shape == q_values.shape, 'candidate_log_probs and q_values must match'
 
-    if exists(mask):
-        mask = mask.bool()
-        assert mask.shape == q_values.shape, 'mask must match q_values'
-
     weights, stats = soft_exit_weights(
         q_values,
         beta = beta,
@@ -682,6 +601,7 @@ def soft_exit_loss(
     )
 
     if exists(mask):
+        mask = mask.bool()
         candidate_log_probs = candidate_log_probs.masked_fill(~mask, 0.)
 
     per_state = -(weights * candidate_log_probs).sum(dim = -1)
